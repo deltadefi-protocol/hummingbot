@@ -50,8 +50,13 @@ KEYS = DeltaDefiConfigMap.model_construct()
 
 
 def is_exchange_information_valid(exchange_info: Dict[str, Any]) -> bool:
+    """Validate a MarketConfigTradingPair entry from /app/market-config."""
+    base_token = exchange_info.get("base_token", {})
+    quote_token = exchange_info.get("quote_token", {})
     return (
-        exchange_info.get("status", None) in ("active", None)
-        and exchange_info.get("base", "") != ""
-        and exchange_info.get("quote", "") != ""
+        exchange_info.get("symbol", "") != ""
+        and isinstance(base_token, dict)
+        and base_token.get("symbol", "") != ""
+        and isinstance(quote_token, dict)
+        and quote_token.get("symbol", "") != ""
     )

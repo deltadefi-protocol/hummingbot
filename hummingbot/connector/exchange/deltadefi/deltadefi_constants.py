@@ -34,7 +34,7 @@ ORDER_SUBMIT_PATH = "/order/submit"
 CANCEL_ORDER_PATH = "/order"  # POST /order/{id}/cancel
 CANCEL_ALL_PATH = "/order/cancel-all"
 MARKET_PRICE_PATH = "/market/market-price"
-TRADING_PAIRS_PATH = "/market/pairs"
+TRADING_PAIRS_PATH = "/app/market-config"
 MARKET_DEPTH_PATH = "/market/depth"
 
 # WS endpoints (separate connections, not channels)
