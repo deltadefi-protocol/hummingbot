@@ -26,6 +26,27 @@ class DeltaDefiCandleBuilder:
         self._current_candle: Optional[Candle] = None
         self._last_trade_timestamp: float = 0.0
 
+    @property
+    def candle_count(self) -> int:
+        """Total number of candles available (completed + current in-progress)."""
+        total = len(self._completed_candles)
+        if self._current_candle is not None:
+            total += 1
+        return total
+
+    def warmup_progress(self, periods: int) -> float:
+        """Return warmup progress as a float from 0.0 to 1.0.
+
+        Args:
+            periods: The number of candles required for the indicator.
+
+        Returns:
+            A float between 0.0 (no data) and 1.0 (fully warmed up).
+        """
+        if periods <= 0:
+            return 1.0
+        return min(self.candle_count / periods, 1.0)
+
     def process_trade(self, price: Decimal, quantity: Decimal, side: str, timestamp: float):
         self._last_trade_timestamp = timestamp
 
