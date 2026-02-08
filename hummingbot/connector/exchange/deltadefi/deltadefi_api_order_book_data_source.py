@@ -36,51 +36,18 @@ class DeltaDefiAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                      domain: Optional[str] = None) -> Dict[str, float]:
         return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
 
-    async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
-        snapshot_response: Dict[str, Any] = await self._request_order_book_snapshot(trading_pair)
-        snapshot_timestamp: float = float(snapshot_response.get("timestamp", 0))
-        if snapshot_timestamp > 1e12:
-            snapshot_timestamp = snapshot_timestamp * 1e-3
-
-        bids = snapshot_response.get("bids", [])
-        asks = snapshot_response.get("asks", [])
-
-        # DeltaDeFi sends {price: F, quantity: F} dicts
-        formatted_bids = [
-            (float(b["price"]), float(b["quantity"])) if isinstance(b, dict) else (b[0], b[1])
-            for b in bids
-        ]
-        formatted_asks = [
-            (float(a["price"]), float(a["quantity"])) if isinstance(a, dict) else (a[0], a[1])
-            for a in asks
-        ]
-
-        order_book_message_content = {
-            "trading_pair": trading_pair,
-            "update_id": int(snapshot_timestamp),
-            "bids": formatted_bids,
-            "asks": formatted_asks,
-        }
-        snapshot_msg: OrderBookMessage = OrderBookMessage(
-            OrderBookMessageType.SNAPSHOT,
-            order_book_message_content,
-            snapshot_timestamp)
-
-        return snapshot_msg
-
-    async def _request_order_book_snapshot(self, trading_pair: str) -> Dict[str, Any]:
-        exchange_symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
-        rest_assistant = await self._api_factory.get_rest_assistant()
-        from hummingbot.core.web_assistant.connections.data_types import RESTMethod
-        data = await rest_assistant.execute_request(
-            url=web_utils.public_rest_url(
-                path_url=f"{CONSTANTS.MARKET_DEPTH_PATH}/{exchange_symbol}",
-                domain=self._connector.domain,
-            ),
-            method=RESTMethod.GET,
-            throttler_limit_id=CONSTANTS.MARKET_DEPTH_PATH,
-        )
-        return data
+    async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
+        # DeltaDeFi has no REST endpoint for order book depth — only a WS handler.
+        # The WS depth stream already sends full snapshots (handled as SNAPSHOT
+        # messages in _parse_order_book_diff_message), so no REST fallback is needed.
+        while True:
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger().exception("Unexpected error in order book snapshot listener.")
+                await asyncio.sleep(5.0)
 
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
         # DeltaDeFi recent-trades WS sends: [{timestamp, symbol, side, price, amount}, ...]

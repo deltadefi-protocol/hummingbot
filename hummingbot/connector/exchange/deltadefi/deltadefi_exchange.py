@@ -187,13 +187,17 @@ class DeltaDefiExchange(ExchangePyBase):
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
         mapping = bidict()
-        pairs_data = exchange_info.get("data", exchange_info) if isinstance(exchange_info, dict) else exchange_info
+        # GetMarketConfigResponse: {"trading_pairs": [...], "assets": [...]}
+        if isinstance(exchange_info, dict):
+            pairs_data = exchange_info.get("trading_pairs", exchange_info.get("data", []))
+        else:
+            pairs_data = exchange_info
         if isinstance(pairs_data, dict):
-            pairs_data = pairs_data.get("data", [])
+            pairs_data = pairs_data.get("trading_pairs", [])
         for symbol_data in filter(deltadefi_utils.is_exchange_information_valid, pairs_data):
-            base = symbol_data["base"]
-            quote = symbol_data["quote"]
-            exchange_symbol = f"{base}{quote}"
+            exchange_symbol = symbol_data["symbol"]
+            base = symbol_data["base_token"]["symbol"]
+            quote = symbol_data["quote_token"]["symbol"]
             hb_pair = combine_to_hb_trading_pair(base=base, quote=quote)
             mapping[exchange_symbol] = hb_pair
         self._set_trading_pair_symbol_map(mapping)
@@ -214,15 +218,15 @@ class DeltaDefiExchange(ExchangePyBase):
         if isinstance(balances, list):
             for balance in balances:
                 asset = balance.get("asset", balance.get("token", ""))
-                available = Decimal(str(balance.get("available", balance.get("available_balance", "0"))))
-                locked = Decimal(str(balance.get("locked", balance.get("locked_balance", "0"))))
+                available = Decimal(str(balance.get("free", balance.get("available", "0"))))
+                locked = Decimal(str(balance.get("locked", "0")))
                 total = available + locked
                 self._account_balances[asset] = total
                 self._account_available_balances[asset] = available
         elif isinstance(balances, dict):
             for asset, bal_data in balances.items():
                 if isinstance(bal_data, dict):
-                    available = Decimal(str(bal_data.get("available", "0")))
+                    available = Decimal(str(bal_data.get("free", "0")))
                     locked = Decimal(str(bal_data.get("locked", "0")))
                 else:
                     available = Decimal(str(bal_data))
@@ -236,19 +240,21 @@ class DeltaDefiExchange(ExchangePyBase):
         trading_rules = []
         pairs_data = raw_trading_pair_info
         if isinstance(raw_trading_pair_info, dict):
-            pairs_data = raw_trading_pair_info.get("data", [])
+            pairs_data = raw_trading_pair_info.get("trading_pairs", raw_trading_pair_info.get("data", []))
         for info in pairs_data:
             try:
                 if deltadefi_utils.is_exchange_information_valid(exchange_info=info):
-                    base = info["base"]
-                    quote = info["quote"]
-                    exchange_symbol = f"{base}{quote}"
+                    exchange_symbol = info["symbol"]
+                    base_token = info["base_token"]
+                    # Derive precision from max_qty_dp and price_max_dp
+                    price_max_dp = info.get("price_max_dp", 4)
+                    base_max_qty_dp = base_token.get("max_qty_dp", 2)
                     trading_rules.append(
                         TradingRule(
                             trading_pair=await self.trading_pair_associated_to_exchange_symbol(symbol=exchange_symbol),
                             min_order_size=Decimal(str(info.get("min_order_size", "0.01"))),
-                            min_price_increment=Decimal(str(info.get("tick_size", "0.000001"))),
-                            min_base_amount_increment=Decimal(str(info.get("step_size", "0.01"))),
+                            min_price_increment=Decimal(10) ** -price_max_dp,
+                            min_base_amount_increment=Decimal(10) ** -base_max_qty_dp,
                         )
                     )
             except Exception:
@@ -421,18 +427,24 @@ class DeltaDefiExchange(ExchangePyBase):
 
             for fill_data in fills:
                 fee_amount = Decimal(str(fill_data.get("commission", fill_data.get("fee", "0"))))
-                fee_asset = fill_data.get("fee_asset", order.quote_asset)
+                fee_asset = fill_data.get("commission_unit", fill_data.get("fee_asset", order.quote_asset))
                 fee = TradeFeeBase.new_spot_fee(
                     fee_schema=self.trade_fee_schema(),
                     trade_type=order.trade_type,
                     percent_token=fee_asset,
                     flat_fees=[TokenAmount(amount=abs(fee_amount), token=fee_asset)]
                 )
-                fill_price = Decimal(str(fill_data.get("executed_price", fill_data.get("price", "0"))))
-                fill_size = Decimal(str(fill_data.get("executed_base_qty", fill_data.get("quantity", "0"))))
-                fill_quote = Decimal(str(fill_data.get("executed_quote_qty", str(fill_size * fill_price))))
+                fill_price = Decimal(str(fill_data.get("execution_price", fill_data.get("price", "0"))))
+                fill_size = Decimal(str(fill_data.get("filled_base_qty", fill_data.get("quantity", "0"))))
+                fill_quote = Decimal(str(fill_data.get("filled_quote_qty", str(fill_size * fill_price))))
+                fill_ts_raw = fill_data.get("created_at", fill_data.get("timestamp", 0))
+                if isinstance(fill_ts_raw, str) and fill_ts_raw:
+                    from dateutil.parser import parse as parse_dt
+                    fill_ts = parse_dt(fill_ts_raw).timestamp()
+                else:
+                    fill_ts = int(fill_ts_raw or 0) * 1e-3
                 trade_update = TradeUpdate(
-                    trade_id=str(fill_data.get("trade_id", fill_data.get("id", ""))),
+                    trade_id=str(fill_data.get("id", fill_data.get("trade_id", ""))),
                     client_order_id=order.client_order_id,
                     exchange_order_id=exchange_order_id,
                     trading_pair=order.trading_pair,
@@ -440,7 +452,7 @@ class DeltaDefiExchange(ExchangePyBase):
                     fill_base_amount=fill_size,
                     fill_quote_amount=fill_quote,
                     fill_price=fill_price,
-                    fill_timestamp=int(fill_data.get("timestamp", 0)) * 1e-3,
+                    fill_timestamp=fill_ts,
                 )
                 trade_updates.append(trade_update)
 
@@ -465,10 +477,19 @@ class DeltaDefiExchange(ExchangePyBase):
             client_order_id=tracked_order.client_order_id,
             exchange_order_id=exchange_order_id,
             trading_pair=tracked_order.trading_pair,
-            update_timestamp=int(order_data.get("timestamp", 0)) * 1e-3,
+            update_timestamp=self._parse_order_timestamp(order_data),
             new_state=new_state,
         )
         return order_update
+
+    @staticmethod
+    def _parse_order_timestamp(data: dict) -> float:
+        ts_raw = data.get("updated_at", data.get("timestamp", 0))
+        if isinstance(ts_raw, str) and ts_raw:
+            from dateutil.parser import parse as parse_dt
+            return parse_dt(ts_raw).timestamp()
+        ts_int = int(ts_raw or 0)
+        return ts_int * 1e-3 if ts_int > 1e12 else float(ts_int)
 
     # --- User stream event processing ---
 
@@ -490,15 +511,21 @@ class DeltaDefiExchange(ExchangePyBase):
                             and order_status in [OrderState.PARTIALLY_FILLED, OrderState.FILLED]
                             and trade_id):
                         fee_amount = Decimal(str(data.get("commission", data.get("fee", "0"))))
-                        fee_asset = data.get("fee_asset", fillable_order.quote_asset)
+                        fee_asset = data.get("commission_unit", data.get("fee_asset", fillable_order.quote_asset))
                         fee = TradeFeeBase.new_spot_fee(
                             fee_schema=self.trade_fee_schema(),
                             trade_type=fillable_order.trade_type,
                             percent_token=fee_asset,
                             flat_fees=[TokenAmount(amount=abs(fee_amount), token=fee_asset)]
                         )
-                        fill_qty = Decimal(str(data.get("executed_base_qty", data.get("filled_quantity", "0"))))
-                        fill_price = Decimal(str(data.get("executed_price", data.get("price", "0"))))
+                        fill_qty = Decimal(str(data.get("filled_base_qty", data.get("executed_base_qty", "0"))))
+                        fill_price = Decimal(str(data.get("execution_price", data.get("executed_price", "0"))))
+                        fill_ts_raw = data.get("created_at", data.get("timestamp", 0))
+                        if isinstance(fill_ts_raw, str) and fill_ts_raw:
+                            from dateutil.parser import parse as parse_dt
+                            fill_ts = parse_dt(fill_ts_raw).timestamp()
+                        else:
+                            fill_ts = int(fill_ts_raw or 0) * 1e-3
                         trade_update = TradeUpdate(
                             trade_id=str(trade_id),
                             client_order_id=fillable_order.client_order_id,
@@ -508,7 +535,7 @@ class DeltaDefiExchange(ExchangePyBase):
                             fill_base_amount=fill_qty,
                             fill_quote_amount=fill_qty * fill_price,
                             fill_price=fill_price,
-                            fill_timestamp=int(data.get("timestamp", 0)) * 1e-3,
+                            fill_timestamp=fill_ts,
                         )
                         self._order_tracker.process_trade_update(trade_update)
 
@@ -518,7 +545,7 @@ class DeltaDefiExchange(ExchangePyBase):
                     if updatable_order is not None:
                         order_update = OrderUpdate(
                             trading_pair=updatable_order.trading_pair,
-                            update_timestamp=int(data.get("timestamp", 0)) * 1e-3,
+                            update_timestamp=self._parse_order_timestamp(data),
                             new_state=order_status,
                             client_order_id=updatable_order.client_order_id,
                             exchange_order_id=str(data.get("order_id", "")),
@@ -531,15 +558,15 @@ class DeltaDefiExchange(ExchangePyBase):
                         for bal in data:
                             asset = bal.get("asset", bal.get("token", ""))
                             if asset:
-                                available = Decimal(str(bal.get("available", bal.get("available_balance", "0"))))
-                                locked = Decimal(str(bal.get("locked", bal.get("locked_balance", "0"))))
+                                available = Decimal(str(bal.get("free", bal.get("available", "0"))))
+                                locked = Decimal(str(bal.get("locked", "0")))
                                 self._account_balances[asset] = available + locked
                                 self._account_available_balances[asset] = available
                     elif isinstance(data, dict):
                         asset = data.get("asset", data.get("token", ""))
                         if asset:
-                            available = Decimal(str(data.get("available", data.get("available_balance", "0"))))
-                            locked = Decimal(str(data.get("locked", data.get("locked_balance", "0"))))
+                            available = Decimal(str(data.get("free", data.get("available", "0"))))
+                            locked = Decimal(str(data.get("locked", "0")))
                             self._account_balances[asset] = available + locked
                             self._account_available_balances[asset] = available
 
@@ -584,7 +611,7 @@ class DeltaDefiExchange(ExchangePyBase):
             )
 
             op_key_data = response.get("data", response) if isinstance(response, dict) else response
-            encrypted_key = op_key_data.get("encrypted_key", op_key_data.get("operation_key", ""))
+            encrypted_key = op_key_data.get("encrypted_operation_key", op_key_data.get("encrypted_key", ""))
 
             if not encrypted_key:
                 self.logger().warning("No operation key returned from API. Transaction signing will not be available.")
