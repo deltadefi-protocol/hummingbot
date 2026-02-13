@@ -9,15 +9,13 @@ from hummingbot.connector.exchange.deltadefi import (
     deltadefi_utils,
     deltadefi_web_utils as web_utils,
 )
-from hummingbot.connector.exchange.deltadefi.deltadefi_api_order_book_data_source import (
-    DeltaDefiAPIOrderBookDataSource,
-)
+from hummingbot.connector.exchange.deltadefi.deltadefi_api_order_book_data_source import DeltaDefiAPIOrderBookDataSource
 from hummingbot.connector.exchange.deltadefi.deltadefi_api_user_stream_data_source import (
     DeltaDefiAPIUserStreamDataSource,
 )
 from hummingbot.connector.exchange.deltadefi.deltadefi_auth import DeltaDefiAuth
 from hummingbot.connector.exchange.deltadefi.deltadefi_candle_builder import DeltaDefiCandleBuilder
-from hummingbot.connector.exchange.deltadefi.deltadefi_health import ConnectorHealth, DeltaDefiHealthMonitor
+from hummingbot.connector.exchange.deltadefi.deltadefi_health import DeltaDefiHealthMonitor
 from hummingbot.connector.exchange.deltadefi.deltadefi_risk import DeltaDefiRiskGuard, RiskConfig
 from hummingbot.connector.exchange_base import s_decimal_NaN
 from hummingbot.connector.exchange_py_base import ExchangePyBase
@@ -34,7 +32,7 @@ from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
-class DeltaDefiExchange(ExchangePyBase):
+class DeltadefiExchange(ExchangePyBase):
 
     web_utils = web_utils
 
@@ -94,7 +92,7 @@ class DeltaDefiExchange(ExchangePyBase):
 
     @property
     def check_network_request_path(self):
-        return CONSTANTS.BALANCE_PATH
+        return CONSTANTS.TRADING_PAIRS_PATH
 
     @property
     def trading_pairs(self):
@@ -619,11 +617,9 @@ class DeltaDefiExchange(ExchangePyBase):
 
             # Attempt to import sidan_gin for Cardano tx signing
             try:
-                from sidan_gin import HDWallet
-                self._operation_wallet = HDWallet.from_encrypted_key(
-                    encrypted_key=encrypted_key,
-                    password=self.deltadefi_password,
-                )
+                from sidan_gin import Wallet, decrypt_with_cipher
+                operation_key = decrypt_with_cipher(encrypted_key, self.deltadefi_password)
+                self._operation_wallet = Wallet.new_root_key(operation_key)
                 self.logger().info("Operation wallet initialized successfully for transaction signing")
             except ImportError:
                 self.logger().warning(
@@ -652,17 +648,26 @@ class DeltaDefiExchange(ExchangePyBase):
 
     async def _reconcile_orders(self):
         try:
-            response = await self._api_request(
-                path_url=CONSTANTS.OPEN_ORDERS_PATH,
-                method=RESTMethod.GET,
-                is_auth_required=True,
-                limit_id=CONSTANTS.OPEN_ORDERS_PATH,
-            )
-            orders_data = response if isinstance(response, list) else response.get("data", [])
-            exchange_orders = {
-                str(o.get("client_order_id", "")): o
-                for o in orders_data
-            }
+            # Fetch open orders for all configured trading pairs
+            all_exchange_orders: Dict[str, Any] = {}
+            for trading_pair in (self._trading_pairs or []):
+                try:
+                    exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+                    response = await self._api_request(
+                        path_url=CONSTANTS.OPEN_ORDERS_PATH,
+                        method=RESTMethod.GET,
+                        params={"symbol": exchange_symbol},
+                        is_auth_required=True,
+                        limit_id=CONSTANTS.OPEN_ORDERS_PATH,
+                    )
+                    orders_data = response if isinstance(response, list) else response.get("data", [])
+                    for o in orders_data:
+                        cid = str(o.get("client_order_id", ""))
+                        if cid:
+                            all_exchange_orders[cid] = o
+                except Exception:
+                    self.logger().debug(f"Could not fetch open orders for {trading_pair}")
+            exchange_orders = all_exchange_orders
 
             for client_order_id, tracked_order in self._order_tracker.active_orders.items():
                 if client_order_id not in exchange_orders:

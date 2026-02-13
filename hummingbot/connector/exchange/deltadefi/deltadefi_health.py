@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional
 from hummingbot.logger import HummingbotLogger
 
 if TYPE_CHECKING:
-    from hummingbot.connector.exchange.deltadefi.deltadefi_exchange import DeltaDefiExchange
+    from hummingbot.connector.exchange.deltadefi.deltadefi_exchange import DeltadefiExchange
 
 
 class ConnectorHealth(Enum):
@@ -20,7 +20,7 @@ class DeltaDefiHealthMonitor:
 
     _logger: Optional[HummingbotLogger] = None
 
-    def __init__(self, connector: 'DeltaDefiExchange', stale_threshold_minutes: float = 3.0):
+    def __init__(self, connector: 'DeltadefiExchange', stale_threshold_minutes: float = 3.0):
         self._connector = connector
         self._stale_threshold_minutes = stale_threshold_minutes
         self._state: ConnectorHealth = ConnectorHealth.NORMAL

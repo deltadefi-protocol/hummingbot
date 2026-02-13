@@ -1,4 +1,5 @@
 import asyncio
+import time
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -13,7 +14,7 @@ from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
 
 if TYPE_CHECKING:
-    from hummingbot.connector.exchange.deltadefi.deltadefi_exchange import DeltaDefiExchange
+    from hummingbot.connector.exchange.deltadefi.deltadefi_exchange import DeltadefiExchange
 
 
 class DeltaDefiAPIOrderBookDataSource(OrderBookTrackerDataSource):
@@ -22,7 +23,7 @@ class DeltaDefiAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     def __init__(self,
                  trading_pairs: List[str],
-                 connector: 'DeltaDefiExchange',
+                 connector: 'DeltadefiExchange',
                  api_factory: WebAssistantsFactory,
                  candle_builder: Optional[DeltaDefiCandleBuilder] = None):
         super().__init__(trading_pairs)
@@ -36,9 +37,24 @@ class DeltaDefiAPIOrderBookDataSource(OrderBookTrackerDataSource):
                                      domain: Optional[str] = None) -> Dict[str, float]:
         return await self._connector.get_last_traded_prices(trading_pairs=trading_pairs)
 
+    async def _order_book_snapshot(self, trading_pair: str) -> OrderBookMessage:
+        # Return an empty snapshot; the authenticated WS depth stream will populate the order book.
+        snapshot_timestamp = time.time()
+        order_book_message_content = {
+            "trading_pair": trading_pair,
+            "update_id": int(snapshot_timestamp),
+            "bids": [],
+            "asks": [],
+        }
+        snapshot_msg = OrderBookMessage(
+            OrderBookMessageType.SNAPSHOT,
+            order_book_message_content,
+            snapshot_timestamp)
+        return snapshot_msg
+
     async def listen_for_order_book_snapshots(self, ev_loop: asyncio.AbstractEventLoop, output: asyncio.Queue):
-        # DeltaDeFi has no REST endpoint for order book depth — only a WS handler.
-        # The WS depth stream already sends full snapshots (handled as SNAPSHOT
+        # DeltaDeFi has no REST endpoint for order book depth.
+        # The authenticated WS depth stream sends full snapshots (handled as SNAPSHOT
         # messages in _parse_order_book_diff_message), so no REST fallback is needed.
         while True:
             try:
@@ -50,6 +66,9 @@ class DeltaDefiAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 await asyncio.sleep(5.0)
 
     async def _parse_trade_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+        # DeltaDeFi WS may send plain string messages (ping/pong) - skip them
+        if not raw_message or isinstance(raw_message, str):
+            return
         # DeltaDeFi recent-trades WS sends: [{timestamp, symbol, side, price, amount}, ...]
         trade_updates = raw_message if isinstance(raw_message, list) else [raw_message]
 
@@ -63,7 +82,12 @@ class DeltaDefiAPIOrderBookDataSource(OrderBookTrackerDataSource):
             side = trade_data.get("side", "").lower()
             price = trade_data.get("price", "0")
             amount = trade_data.get("amount", "0")
-            timestamp = int(trade_data.get("timestamp", 0))
+            ts_raw = trade_data.get("timestamp", 0)
+            if isinstance(ts_raw, str) and ts_raw:
+                from dateutil.parser import parse as parse_dt
+                timestamp = int(parse_dt(ts_raw).timestamp())
+            else:
+                timestamp = int(ts_raw) if ts_raw else 0
 
             message_content = {
                 "trade_id": trade_data.get("trade_id", str(timestamp)),
@@ -88,6 +112,8 @@ class DeltaDefiAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 )
 
     async def _parse_order_book_diff_message(self, raw_message: Dict[str, Any], message_queue: asyncio.Queue):
+        if not raw_message or not isinstance(raw_message, dict):
+            return
         # DeltaDeFi depth WS sends full snapshots each time:
         # {timestamp: N, bids: [{price: F, quantity: F}], asks: [{price: F, quantity: F}]}
         timestamp = float(raw_message.get("timestamp", 0))
@@ -130,6 +156,8 @@ class DeltaDefiAPIOrderBookDataSource(OrderBookTrackerDataSource):
         self.logger().info("Connected to market depth stream (auto-subscribed)")
 
     def _channel_originating_message(self, event_message: Dict[str, Any]) -> str:
+        if not isinstance(event_message, dict):
+            return ""
         # All messages from the depth WS go to the diff (snapshot) queue
         if "bids" in event_message or "asks" in event_message:
             return self._diff_messages_queue_key
@@ -137,6 +165,7 @@ class DeltaDefiAPIOrderBookDataSource(OrderBookTrackerDataSource):
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         # Connect to depth WS for the first trading pair
+        # DeltaDeFi depth WS requires api_key query parameter for authentication
         if not self._trading_pairs:
             raise ValueError("No trading pairs configured for order book data source")
 
@@ -146,6 +175,7 @@ class DeltaDefiAPIOrderBookDataSource(OrderBookTrackerDataSource):
             symbol=symbol,
             domain=self._connector.domain,
         )
+        ws_url = f"{ws_url}?api_key={self._connector.deltadefi_api_key}"
         ws: WSAssistant = await self._api_factory.get_ws_assistant()
         async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_CONNECTION_LIMIT_ID):
             await ws.connect(
@@ -166,6 +196,7 @@ class DeltaDefiAPIOrderBookDataSource(OrderBookTrackerDataSource):
                     symbol=symbol,
                     domain=self._connector.domain,
                 )
+                ws_url = f"{ws_url}?api_key={self._connector.deltadefi_api_key}"
                 trades_ws = await self._api_factory.get_ws_assistant()
                 async with self._api_factory.throttler.execute_task(limit_id=CONSTANTS.WS_CONNECTION_LIMIT_ID):
                     await trades_ws.connect(
@@ -189,6 +220,14 @@ class DeltaDefiAPIOrderBookDataSource(OrderBookTrackerDataSource):
             except Exception:
                 self.logger().exception("Unexpected error in trades listener. Reconnecting...")
                 await asyncio.sleep(5.0)
+
+    async def subscribe_to_trading_pair(self, trading_pair: str) -> bool:
+        # DeltaDeFi WS is per-symbol: connecting to the endpoint is the subscription.
+        return True
+
+    async def unsubscribe_from_trading_pair(self, trading_pair: str) -> bool:
+        # DeltaDeFi WS is per-symbol: disconnecting is the unsubscription.
+        return True
 
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant):
         while True:

@@ -10,7 +10,7 @@ from hummingbot.core.web_assistant.ws_assistant import WSAssistant
 from hummingbot.logger import HummingbotLogger
 
 if TYPE_CHECKING:
-    from hummingbot.connector.exchange.deltadefi.deltadefi_exchange import DeltaDefiExchange
+    from hummingbot.connector.exchange.deltadefi.deltadefi_exchange import DeltadefiExchange
 
 
 class DeltaDefiAPIUserStreamDataSource(UserStreamTrackerDataSource):
@@ -20,7 +20,7 @@ class DeltaDefiAPIUserStreamDataSource(UserStreamTrackerDataSource):
     def __init__(
             self,
             auth: DeltaDefiAuth,
-            connector: 'DeltaDefiExchange',
+            connector: 'DeltadefiExchange',
             api_factory: WebAssistantsFactory):
         super().__init__()
         self._auth: DeltaDefiAuth = auth
@@ -57,7 +57,7 @@ class DeltaDefiAPIUserStreamDataSource(UserStreamTrackerDataSource):
     async def _process_event_message(self, event_message: Dict[str, Any], queue: asyncio.Queue):
         # DeltaDeFi account stream messages have format:
         # {type: "Account", sub_type: "balance"|"order_info"|"dlta_points", ...}
-        if not event_message:
+        if not event_message or not isinstance(event_message, dict):
             return
         msg_type = event_message.get("type", "")
         sub_type = event_message.get("sub_type", "")

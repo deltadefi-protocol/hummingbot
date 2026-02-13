@@ -1,12 +1,12 @@
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Tuple
 
 from hummingbot.core.data_type.common import TradeType
 
 if TYPE_CHECKING:
-    from hummingbot.connector.exchange.deltadefi.deltadefi_exchange import DeltaDefiExchange
+    from hummingbot.connector.exchange.deltadefi.deltadefi_exchange import DeltadefiExchange
 
 
 @dataclass
@@ -21,7 +21,7 @@ class RiskConfig:
 
 class DeltaDefiRiskGuard:
 
-    def __init__(self, config: RiskConfig, connector: 'DeltaDefiExchange'):
+    def __init__(self, config: RiskConfig, connector: 'DeltadefiExchange'):
         self._config = config
         self._connector = connector
         self._daily_volume: Decimal = Decimal("0")

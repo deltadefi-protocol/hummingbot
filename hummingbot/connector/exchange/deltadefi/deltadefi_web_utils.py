@@ -1,3 +1,4 @@
+import time
 from typing import Optional
 
 import hummingbot.connector.exchange.deltadefi.deltadefi_constants as CONSTANTS
@@ -42,3 +43,11 @@ def build_api_factory(
 
 def create_throttler() -> AsyncThrottler:
     return AsyncThrottler(CONSTANTS.RATE_LIMITS)
+
+
+async def get_current_server_time(
+        throttler: Optional[AsyncThrottler] = None,
+        domain: str = CONSTANTS.DEFAULT_DOMAIN,
+) -> float:
+    # DeltaDeFi has no server time endpoint; use local time.
+    return time.time()
