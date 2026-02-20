@@ -426,6 +426,10 @@ class DeltadefiExchange(ExchangePyBase):
             for fill_data in fills:
                 fee_amount = Decimal(str(fill_data.get("commission", fill_data.get("fee", "0"))))
                 fee_asset = fill_data.get("commission_unit", fill_data.get("fee_asset", order.quote_asset))
+                # Normalize Cardano lovelace to ADA (1 ADA = 1,000,000 lovelace)
+                if fee_asset == "lovelace":
+                    fee_asset = "ADA"
+                    fee_amount = fee_amount / Decimal("1000000")
                 fee = TradeFeeBase.new_spot_fee(
                     fee_schema=self.trade_fee_schema(),
                     trade_type=order.trade_type,
@@ -510,6 +514,10 @@ class DeltadefiExchange(ExchangePyBase):
                             and trade_id):
                         fee_amount = Decimal(str(data.get("commission", data.get("fee", "0"))))
                         fee_asset = data.get("commission_unit", data.get("fee_asset", fillable_order.quote_asset))
+                        # Normalize Cardano lovelace to ADA (1 ADA = 1,000,000 lovelace)
+                        if fee_asset == "lovelace":
+                            fee_asset = "ADA"
+                            fee_amount = fee_amount / Decimal("1000000")
                         fee = TradeFeeBase.new_spot_fee(
                             fee_schema=self.trade_fee_schema(),
                             trade_type=fillable_order.trade_type,
