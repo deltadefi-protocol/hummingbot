@@ -11,8 +11,11 @@ from pydantic import Field
 
 from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.connector_base import ConnectorBase
+from hummingbot.connector.exchange.deltadefi import deltadefi_constants as CONSTANTS
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.event.events import OrderFilledEvent
+from hummingbot.core.utils.async_utils import safe_ensure_future
+from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 D = Decimal
@@ -37,7 +40,7 @@ class DeltaDefiAMMConfig(BaseClientModel):
     trading_pair: str = Field("ADA-USDM")
     initial_price: Decimal = Field(D("0.2789"))
     pool_depth: Decimal = Field(D("5000"))
-    base_spread_bps: Decimal = Field(D("50"))
+    base_spread_bps: Decimal = Field(D("20"))
     max_cumulative_loss: Decimal = Field(D("100"))
     min_base_balance: Decimal = Field(D("1000"))
     min_quote_balance: Decimal = Field(D("500"))
@@ -45,7 +48,6 @@ class DeltaDefiAMMConfig(BaseClientModel):
     amplification: Decimal = Field(D("20"))
     num_levels: int = Field(3)
     size_decay: Decimal = Field(D("0.7"))
-    spread_multiplier: Decimal = Field(D("1.5"))
     order_amount_pct: Decimal = Field(D("0.05"))
     order_refresh_time: int = Field(5)
     floor_ratio: Decimal = Field(D("0.30"))
@@ -202,6 +204,7 @@ class DeltaDefiAMM(ScriptStrategyBase):
     _refresh_timestamp: float = 0
     _last_rebalance: float = 0
     _stopped: bool = False
+    _needs_refresh: bool = False
 
     @classmethod
     def init_markets(cls, config: DeltaDefiAMMConfig):
@@ -247,6 +250,18 @@ class DeltaDefiAMM(ScriptStrategyBase):
         if self._check_circuit_breakers():
             return
 
+        if self._needs_refresh:
+            self._needs_refresh = False
+            self._cancel_all_orders()
+            mid = self.pool.get_mid_price()
+            base_avail, quote_avail = self.pool.get_available_reserves(self.config.floor_ratio)
+            orders = self._generate_orders(mid, base_avail, quote_avail)
+            orders = self.balance_gate.scale_orders(orders)
+            self._place_orders(orders)
+            self._check_rebalance()
+            self._refresh_timestamp = self.current_timestamp + self.config.order_refresh_time
+            return
+
         if self.current_timestamp < self._refresh_timestamp:
             return
 
@@ -280,7 +295,7 @@ class DeltaDefiAMM(ScriptStrategyBase):
         pair = self.config.trading_pair
 
         for i in range(self.config.num_levels):
-            base_spread = self.config.base_spread_bps * (self.config.spread_multiplier ** i) / D("10000")
+            base_spread = self.config.base_spread_bps * D(2 * i + 1) / D("10000")
             w = weights[i] / total_weight
 
             if self.config.enable_asymmetric_spread:
@@ -334,8 +349,18 @@ class DeltaDefiAMM(ScriptStrategyBase):
                 self.buy(self.config.exchange, self.config.trading_pair, o.size, OrderType.LIMIT, o.price)
 
     def _cancel_all_orders(self):
+        safe_ensure_future(self._cancel_all_orders_async())
+
+    async def _cancel_all_orders_async(self):
+        connector = self.connectors[self.config.exchange]
+        await connector._api_request(
+            path_url=CONSTANTS.CANCEL_ALL_PATH,
+            method=RESTMethod.POST,
+            is_auth_required=True,
+            limit_id=CONSTANTS.CANCEL_ALL_PATH,
+        )
         for order in self.get_active_orders(connector_name=self.config.exchange):
-            self.cancel(self.config.exchange, order.trading_pair, order.client_order_id)
+            connector.stop_tracking_order(order.client_order_id)
 
     # ---- Circuit breakers -------------------------------------------------
 
@@ -460,9 +485,8 @@ class DeltaDefiAMM(ScriptStrategyBase):
         self.log_with_clock(logging.INFO, msg)
         self.notify_hb_app_with_timestamp(msg)
 
-        # Cancel stale orders and requote immediately from updated pool
-        self._cancel_all_orders()
-        self._refresh_orders()
+        # Defer requote to next tick (debounce fill cascades)
+        self._needs_refresh = True
 
     def _refresh_orders(self):
         mid = self.pool.get_mid_price()
