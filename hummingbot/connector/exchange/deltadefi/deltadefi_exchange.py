@@ -4,6 +4,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from bidict import bidict
 
+try:
+    from sidan_gin import Wallet, decrypt_with_cipher
+    _HAS_SIDAN_GIN = True
+except ImportError:
+    _HAS_SIDAN_GIN = False
+
 from hummingbot.connector.exchange.deltadefi import (
     deltadefi_constants as CONSTANTS,
     deltadefi_utils,
@@ -642,19 +648,18 @@ class DeltadefiExchange(ExchangePyBase):
                 self.logger().warning("No operation key returned from API. Transaction signing will not be available.")
                 return
 
-            # Attempt to import sidan_gin for Cardano tx signing
-            try:
-                from sidan_gin import Wallet, decrypt_with_cipher
-                operation_key = decrypt_with_cipher(encrypted_key, self.deltadefi_password)
-                self._operation_wallet = Wallet.new_root_key(operation_key)
-                self.logger().info("Operation wallet initialized successfully for transaction signing")
-            except ImportError as e:
+            if _HAS_SIDAN_GIN:
+                try:
+                    operation_key = decrypt_with_cipher(encrypted_key, self.deltadefi_password)
+                    self._operation_wallet = Wallet.new_root_key(operation_key)
+                    self.logger().info("Operation wallet initialized successfully for transaction signing")
+                except Exception as e:
+                    self.logger().error(f"Failed to decrypt operation key: {e}")
+            else:
                 self.logger().warning(
-                    f"sidan-gin import failed: {e}. Transaction signing will not be available. "
+                    "sidan-gin package not available. Transaction signing will not be available. "
                     "Install with: pip install sidan-gin"
                 )
-            except Exception as e:
-                self.logger().error(f"Failed to decrypt operation key: {e}")
 
         except Exception:
             self.logger().exception("Error fetching operation key. Transaction signing may not work.")
