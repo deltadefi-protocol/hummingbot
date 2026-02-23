@@ -40,6 +40,8 @@ class DeltadefiExchange(ExchangePyBase):
                  deltadefi_api_key: str,
                  deltadefi_password: str,
                  deltadefi_network: str = CONSTANTS.DEFAULT_DOMAIN,
+                 deltadefi_custom_rest_url: str = "",
+                 deltadefi_custom_wss_url: str = "",
                  trading_pairs: Optional[List[str]] = None,
                  trading_required: bool = True,
                  balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
@@ -47,6 +49,11 @@ class DeltadefiExchange(ExchangePyBase):
         self.deltadefi_api_key = deltadefi_api_key
         self.deltadefi_password = deltadefi_password
         self.deltadefi_network = deltadefi_network or CONSTANTS.DEFAULT_DOMAIN
+
+        if deltadefi_custom_rest_url:
+            CONSTANTS.REST_URLS[self.deltadefi_network] = deltadefi_custom_rest_url.rstrip("/")
+        if deltadefi_custom_wss_url:
+            CONSTANTS.WSS_URLS[self.deltadefi_network] = deltadefi_custom_wss_url.rstrip("/")
         self._trading_required = trading_required
         self._trading_pairs = trading_pairs
         self._candle_builder: Optional[DeltaDefiCandleBuilder] = None
@@ -387,19 +394,33 @@ class DeltadefiExchange(ExchangePyBase):
         exchange_order_id = await tracked_order.get_exchange_order_id()
         cancel_url = f"{CONSTANTS.CANCEL_ORDER_PATH}/{exchange_order_id}/cancel"
 
-        cancel_result = await self._api_request(
-            path_url=cancel_url,
-            method=RESTMethod.POST,
-            is_auth_required=True,
-            limit_id=CONSTANTS.CANCEL_ORDER_PATH,
-        )
+        try:
+            cancel_result = await self._api_request(
+                path_url=cancel_url,
+                method=RESTMethod.POST,
+                is_auth_required=True,
+                limit_id=CONSTANTS.CANCEL_ORDER_PATH,
+            )
+        except IOError as e:
+            # Treat HTTP 404 or similar as "order already gone"
+            err_str = str(e).lower()
+            if "404" in err_str or "not found" in err_str:
+                self.logger().info(f"Order {order_id} already gone on exchange (HTTP error). Treating as cancelled.")
+                return True
+            raise
 
         if isinstance(cancel_result, dict):
-            status = cancel_result.get("status", "")
+            status = cancel_result.get("status", "").lower()
             if status in ("success", "cancelled", "canceled"):
                 return True
-            error_code = cancel_result.get("code", "")
-            if error_code == "ORDER_NOT_FOUND":
+            error_code = cancel_result.get("code", "").upper()
+            error_msg = cancel_result.get("message", cancel_result.get("msg", "")).lower()
+            # Order no longer exists on exchange — treat as successfully cancelled
+            if error_code in ("ORDER_NOT_FOUND", "ORDER_ALREADY_CANCELLED", "ORDER_ALREADY_FILLED"):
+                self.logger().info(f"Order {order_id} already gone on exchange ({error_code}). Treating as cancelled.")
+                return True
+            if "not found" in error_msg or "already" in error_msg:
+                self.logger().info(f"Order {order_id} already gone on exchange ({error_msg}). Treating as cancelled.")
                 return True
         raise IOError(f"Error cancelling order {order_id}: {cancel_result}")
 
@@ -599,6 +620,8 @@ class DeltadefiExchange(ExchangePyBase):
         await super().start_network()
         # Fetch and decrypt operation key for tx signing
         await self._initialize_operation_wallet()
+        # Cancel any orphan orders left on exchange from previous session
+        await self._cancel_all_on_exchange()
         self._reconciliation_task = safe_ensure_future(self._reconciliation_loop())
 
     async def stop_network(self):
@@ -639,6 +662,23 @@ class DeltadefiExchange(ExchangePyBase):
 
         except Exception:
             self.logger().exception("Error fetching operation key. Transaction signing may not work.")
+
+    async def _cancel_all_on_exchange(self):
+        """Cancel all open orders on the exchange for configured trading pairs.
+        Called on startup to clean up orphans from previous sessions."""
+        for trading_pair in (self._trading_pairs or []):
+            try:
+                exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+                await self._api_request(
+                    path_url=CONSTANTS.CANCEL_ALL_PATH,
+                    method=RESTMethod.POST,
+                    data={"symbol": exchange_symbol},
+                    is_auth_required=True,
+                    limit_id=CONSTANTS.CANCEL_ALL_PATH,
+                )
+                self.logger().info(f"Startup cancel-all sent for {trading_pair}")
+            except Exception:
+                self.logger().debug(f"Startup cancel-all failed for {trading_pair} (may have no open orders)")
 
     # --- Reconciliation ---
 

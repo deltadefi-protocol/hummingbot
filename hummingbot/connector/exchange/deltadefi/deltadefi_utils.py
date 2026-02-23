@@ -39,9 +39,25 @@ class DeltaDefiConfigMap(BaseConnectorConfigMap):
     deltadefi_network: str = Field(
         default="mainnet",
         json_schema_extra={
-            "prompt": "Which DeltaDeFi network? (mainnet/testnet)",
+            "prompt": "Which DeltaDeFi network? (mainnet/testnet/local)",
             "is_connect_key": True,
             "prompt_on_new": True,
+        }
+    )
+    deltadefi_custom_rest_url: str = Field(
+        default="",
+        json_schema_extra={
+            "prompt": "Custom REST API URL (leave empty for default)",
+            "is_connect_key": False,
+            "prompt_on_new": False,
+        }
+    )
+    deltadefi_custom_wss_url: str = Field(
+        default="",
+        json_schema_extra={
+            "prompt": "Custom WebSocket URL (leave empty for default)",
+            "is_connect_key": False,
+            "prompt_on_new": False,
         }
     )
 
