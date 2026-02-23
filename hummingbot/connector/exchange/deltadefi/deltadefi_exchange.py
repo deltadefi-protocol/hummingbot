@@ -61,6 +61,7 @@ class DeltadefiExchange(ExchangePyBase):
         self._risk_guard: Optional[DeltaDefiRiskGuard] = None
         self._reconciliation_task: Optional[asyncio.Task] = None
         self._operation_wallet = None  # Initialized on start_network
+        self._asset_id_to_symbol: Dict[str, str] = {"lovelace": "ADA"}
         super().__init__(balance_asset_limit, rate_limits_share_pct)
 
     # --- Properties required by ExchangePyBase ---
@@ -201,10 +202,18 @@ class DeltadefiExchange(ExchangePyBase):
             pairs_data = pairs_data.get("trading_pairs", [])
         for symbol_data in filter(deltadefi_utils.is_exchange_information_valid, pairs_data):
             exchange_symbol = symbol_data["symbol"]
-            base = symbol_data["base_token"]["symbol"]
-            quote = symbol_data["quote_token"]["symbol"]
+            base_token = symbol_data["base_token"]
+            quote_token = symbol_data["quote_token"]
+            base = base_token["symbol"]
+            quote = quote_token["symbol"]
             hb_pair = combine_to_hb_trading_pair(base=base, quote=quote)
             mapping[exchange_symbol] = hb_pair
+            # Map Cardano policy IDs / unit strings to friendly symbols
+            for token_data, symbol in [(base_token, base), (quote_token, quote)]:
+                for key in ("unit", "policy_id", "asset_id"):
+                    asset_id = token_data.get(key, "")
+                    if asset_id and asset_id != symbol:
+                        self._asset_id_to_symbol[asset_id] = symbol
         self._set_trading_pair_symbol_map(mapping)
 
     # --- Balance updates ---
@@ -447,10 +456,10 @@ class DeltadefiExchange(ExchangePyBase):
             for fill_data in fills:
                 fee_amount = Decimal(str(fill_data.get("commission", fill_data.get("fee", "0"))))
                 fee_asset = fill_data.get("commission_unit", fill_data.get("fee_asset", order.quote_asset))
-                # Normalize Cardano lovelace to ADA (1 ADA = 1,000,000 lovelace)
+                # Normalize Cardano asset IDs (policy IDs, lovelace) to friendly symbols
                 if fee_asset == "lovelace":
-                    fee_asset = "ADA"
                     fee_amount = fee_amount / Decimal("1000000")
+                fee_asset = self._asset_id_to_symbol.get(fee_asset, fee_asset)
                 fee = TradeFeeBase.new_spot_fee(
                     fee_schema=self.trade_fee_schema(),
                     trade_type=order.trade_type,
@@ -526,48 +535,26 @@ class DeltadefiExchange(ExchangePyBase):
                     data = stream_message.get("data", stream_message)
                     order_status = CONSTANTS.ORDER_STATE.get(data.get("status", ""), OrderState.OPEN)
                     client_order_id = data.get("client_order_id", "")
-                    trade_id = data.get("trade_id", "")
                     fillable_order = self._order_tracker.all_fillable_orders.get(client_order_id)
                     updatable_order = self._order_tracker.all_updatable_orders.get(client_order_id)
 
                     if (fillable_order is not None
-                            and order_status in [OrderState.PARTIALLY_FILLED, OrderState.FILLED]
-                            and trade_id):
-                        fee_amount = Decimal(str(data.get("commission", data.get("fee", "0"))))
-                        fee_asset = data.get("commission_unit", data.get("fee_asset", fillable_order.quote_asset))
-                        # Normalize Cardano lovelace to ADA (1 ADA = 1,000,000 lovelace)
-                        if fee_asset == "lovelace":
-                            fee_asset = "ADA"
-                            fee_amount = fee_amount / Decimal("1000000")
-                        fee = TradeFeeBase.new_spot_fee(
-                            fee_schema=self.trade_fee_schema(),
-                            trade_type=fillable_order.trade_type,
-                            percent_token=fee_asset,
-                            flat_fees=[TokenAmount(amount=abs(fee_amount), token=fee_asset)]
-                        )
-                        fill_qty = Decimal(str(data.get("filled_base_qty", data.get("executed_base_qty", "0"))))
-                        fill_price = Decimal(str(data.get("execution_price", data.get("executed_price", "0"))))
-                        fill_ts_raw = data.get("created_at", data.get("timestamp", 0))
-                        if isinstance(fill_ts_raw, str) and fill_ts_raw:
-                            from dateutil.parser import parse as parse_dt
-                            fill_ts = parse_dt(fill_ts_raw).timestamp()
-                        else:
-                            fill_ts = int(fill_ts_raw or 0) * 1e-3
-                        trade_update = TradeUpdate(
-                            trade_id=str(trade_id),
-                            client_order_id=fillable_order.client_order_id,
-                            exchange_order_id=str(data.get("order_id", "")),
-                            trading_pair=fillable_order.trading_pair,
-                            fee=fee,
-                            fill_base_amount=fill_qty,
-                            fill_quote_amount=fill_qty * fill_price,
-                            fill_price=fill_price,
-                            fill_timestamp=fill_ts,
-                        )
-                        self._order_tracker.process_trade_update(trade_update)
-
-                        if self._risk_guard is not None:
-                            self._risk_guard.on_fill(amount=fill_qty, price=fill_price)
+                            and order_status in [OrderState.PARTIALLY_FILLED, OrderState.FILLED]):
+                        # Fetch fill details via REST — websocket order_info
+                        # messages may not include trade_id or fill amounts
+                        try:
+                            trade_updates = await self._all_trade_updates_for_order(fillable_order)
+                            for trade_update in trade_updates:
+                                self._order_tracker.process_trade_update(trade_update)
+                                if self._risk_guard is not None:
+                                    self._risk_guard.on_fill(
+                                        amount=trade_update.fill_base_amount,
+                                        price=trade_update.fill_price,
+                                    )
+                        except Exception:
+                            self.logger().debug(
+                                f"Failed to fetch fill details for {client_order_id} via REST"
+                            )
 
                     if updatable_order is not None:
                         order_update = OrderUpdate(

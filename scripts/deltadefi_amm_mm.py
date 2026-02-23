@@ -13,6 +13,7 @@ from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.event.events import OrderFilledEvent
+from hummingbot.core.rate_oracle.rate_oracle import RateOracle
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
@@ -70,7 +71,6 @@ class DeltaDefiAMMConfig(BaseClientModel):
     min_spread_bps: Decimal = Field(D("20"))
     enable_order_randomization: bool = Field(False)
     randomization_pct: Decimal = Field(D("0.15"))
-    breakeven_margin_bps: Decimal = Field(D("10"))
 
     @model_validator(mode="after")
     def apply_pair_presets(self):
@@ -236,19 +236,11 @@ class DeltaDefiAMM(ScriptStrategyBase):
             self.pool = VirtualPool.from_state(state)
             self._base_flow = D(str(state.get("base_flow", "0")))
             self._quote_flow = D(str(state.get("quote_flow", "0")))
-            self._total_bought = D(str(state.get("total_bought", "0")))
-            self._total_buy_cost = D(str(state.get("total_buy_cost", "0")))
-            self._total_sold = D(str(state.get("total_sold", "0")))
-            self._total_sell_revenue = D(str(state.get("total_sell_revenue", "0")))
             self.logger().info(f"Restored pool state from {self._state_file}")
         else:
             self.pool = VirtualPool(self.config.initial_price, self.config.pool_depth, self.config.amplification)
             self._base_flow = ZERO
             self._quote_flow = ZERO
-            self._total_bought = ZERO
-            self._total_buy_cost = ZERO
-            self._total_sold = ZERO
-            self._total_sell_revenue = ZERO
             self.logger().info(
                 f"Initialized new pool: {self.config.trading_pair} @ {self.config.initial_price} "
                 f"depth={self.config.pool_depth}"
@@ -273,20 +265,28 @@ class DeltaDefiAMM(ScriptStrategyBase):
 
         has_active = bool(self.get_active_orders(connector_name=self.config.exchange))
 
-        # In fill-only mode, skip if orders are already on the book
-        if self.config.refresh_on_fill_only and has_active:
-            return
+        # In fill-only mode, skip if orders are on the book, no fill pending,
+        # and refresh timeout hasn't been reached.
+        # _refresh_timestamp == 0 means a fill just happened and we need to requote.
+        # Once _refresh_timestamp is exceeded, force a requote as a safety net
+        # (handles partial placements from rate limits, stale orders, etc.)
+        if self.config.refresh_on_fill_only and has_active and self._refresh_timestamp > 0:
+            if self.current_timestamp < self._refresh_timestamp:
+                return
 
         if self.current_timestamp < self._refresh_timestamp:
             return
 
-        self._cancel_all_orders()
-
-        # Don't place new orders until previous cancels are confirmed
-        if self.get_active_orders(connector_name=self.config.exchange):
+        # Two-phase refresh: cancel first, place on next tick once cleared.
+        # This prevents snowballing orders when async cancels haven't confirmed.
+        if has_active:
+            self._cancel_all_orders()
+            # Allow up to order_refresh_time for cancels to confirm before retrying
+            self._refresh_timestamp = self.current_timestamp + self.config.order_refresh_time
             return
 
         mid = self._get_book_mid() or self.pool.get_mid_price()
+        RateOracle.get_instance().set_price(self.config.trading_pair, mid)
         base_avail, quote_avail = self.pool.get_available_reserves(self.config.floor_ratio)
 
         orders = self._generate_orders(mid, base_avail, quote_avail)
@@ -313,10 +313,6 @@ class DeltaDefiAMM(ScriptStrategyBase):
         connector = self.connectors[self.config.exchange]
         pair = self.config.trading_pair
 
-        margin = self.config.breakeven_margin_bps / D("10000")
-        min_ask_floor = (self._total_buy_cost / self._total_bought) * (D(1) + margin) if self._total_bought > ZERO else None
-        max_bid_ceil = (self._total_sell_revenue / self._total_sold) * (D(1) - margin) if self._total_sold > ZERO else None
-
         for i in range(self.config.num_levels):
             base_spread = self.config.base_spread_bps * (self.config.spread_multiplier ** i) / D("10000")
             w = weights[i] / total_weight
@@ -328,11 +324,6 @@ class DeltaDefiAMM(ScriptStrategyBase):
 
             ask_price = mid_price * (D(1) + ask_spread)
             bid_price = mid_price * (D(1) - bid_spread)
-
-            if min_ask_floor is not None:
-                ask_price = max(ask_price, min_ask_floor)
-            if max_bid_ceil is not None:
-                bid_price = min(bid_price, max_bid_ceil)
 
             ask_size = total_ask_budget * w
             bid_size = (total_bid_budget * w) / bid_price if bid_price > ZERO else ZERO
@@ -382,10 +373,6 @@ class DeltaDefiAMM(ScriptStrategyBase):
     async def _cancel_all_orders_async(self):
         connector = self.connectors[self.config.exchange]
         await connector.cancel_all(timeout_seconds=10.0)
-        remaining = self.get_active_orders(connector_name=self.config.exchange)
-        if remaining:
-            self.logger().info(f"Retry cancel: {len(remaining)} orders still active after cancel-all")
-            await connector.cancel_all(timeout_seconds=10.0)
 
     # ---- Circuit breakers -------------------------------------------------
 
@@ -441,16 +428,6 @@ class DeltaDefiAMM(ScriptStrategyBase):
         rebalance_amount = abs(target_base - self.pool.base)
         side = TradeType.BUY if self.pool.base < target_base else TradeType.SELL
 
-        if side == TradeType.SELL and self._total_bought > ZERO:
-            avg_buy = self._total_buy_cost / self._total_bought
-            if book_mid < avg_buy:
-                return  # don't sell at a loss via market order
-
-        if side == TradeType.BUY and self._total_sold > ZERO:
-            avg_sell = self._total_sell_revenue / self._total_sold
-            if book_mid > avg_sell:
-                return  # don't buy above avg sell via market order
-
         # Cap to real balance
         real_base, real_quote = self.balance_gate.get_real_balances()
         if side == TradeType.BUY:
@@ -478,13 +455,9 @@ class DeltaDefiAMM(ScriptStrategyBase):
         if event.trade_type == TradeType.SELL:
             self._base_flow -= event.amount
             self._quote_flow += event.price * event.amount
-            self._total_sold += event.amount
-            self._total_sell_revenue += event.amount * event.price
         else:
             self._base_flow += event.amount
             self._quote_flow -= event.price * event.amount
-            self._total_bought += event.amount
-            self._total_buy_cost += event.amount * event.price
 
         # Update virtual pool
         self.pool.update_on_fill(event.trade_type, event.amount)
@@ -508,6 +481,7 @@ class DeltaDefiAMM(ScriptStrategyBase):
 
         # Cancel stale orders — next on_tick will requote once cancels confirm
         self._cancel_all_orders()
+        self._refresh_timestamp = 0
 
     # ---- P&L --------------------------------------------------------------
 
@@ -533,10 +507,6 @@ class DeltaDefiAMM(ScriptStrategyBase):
         state = self.pool.to_state()
         state["base_flow"] = str(self._base_flow)
         state["quote_flow"] = str(self._quote_flow)
-        state["total_bought"] = str(self._total_bought)
-        state["total_buy_cost"] = str(self._total_buy_cost)
-        state["total_sold"] = str(self._total_sold)
-        state["total_sell_revenue"] = str(self._total_sell_revenue)
         with open(self._state_file, "w") as f:
             json.dump(state, f, indent=2)
 
@@ -578,17 +548,6 @@ class DeltaDefiAMM(ScriptStrategyBase):
         ]
 
         # Break-even tracking
-        if self._total_bought > ZERO:
-            avg_buy = self._total_buy_cost / self._total_bought
-            lines.append(f"  Avg Buy: {avg_buy:.6f} ({self._total_bought:.2f} {base_token})")
-            if book_mid is not None and book_mid < avg_buy:
-                lines.append(f"  ** ASK CLAMPED: market {book_mid:.6f} < avg_buy {avg_buy:.6f} **")
-        if self._total_sold > ZERO:
-            avg_sell = self._total_sell_revenue / self._total_sold
-            lines.append(f"  Avg Sell: {avg_sell:.6f} ({self._total_sold:.2f} {base_token})")
-            if book_mid is not None and book_mid > avg_sell:
-                lines.append(f"  ** BID CLAMPED: market {book_mid:.6f} > avg_sell {avg_sell:.6f} **")
-
         if self._stopped:
             lines.append("  *** STOPPED - loss limit exceeded ***")
 
