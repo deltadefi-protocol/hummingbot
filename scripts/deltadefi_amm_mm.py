@@ -54,18 +54,16 @@ class DeltaDefiAMMConfig(BaseClientModel):
     spread_multiplier: Decimal = Field(D("1.5"))
     order_amount_pct: Decimal = Field(D("0.015"))
     order_refresh_time: int = Field(5)
+    refresh_on_fill_only: bool = Field(True)
     floor_ratio: Decimal = Field(D("0.30"))
     balance_buffer_pct: Decimal = Field(D("0.90"))
     rebalance_threshold: Decimal = Field(D("0.02"))
     rebalance_cooldown: int = Field(60)
-    max_book_spread_bps: Decimal = Field(D("150"))
     min_both_sides_pct: Decimal = Field(D("0.40"))
     # Enhancement flags
     enable_fill_velocity_detector: bool = Field(False)
     fill_velocity_window_sec: int = Field(10)
     fill_velocity_max_same_side: int = Field(3)
-    enable_book_divergence_monitor: bool = Field(True)
-    book_divergence_cancel_bps: Decimal = Field(D("50"))
     enable_asymmetric_spread: bool = Field(False)
     skew_sensitivity: Decimal = Field(D("0.5"))
     min_spread_bps: Decimal = Field(D("20"))
@@ -272,6 +270,12 @@ class DeltaDefiAMM(ScriptStrategyBase):
         if self._check_circuit_breakers():
             return
 
+        has_active = bool(self.get_active_orders(connector_name=self.config.exchange))
+
+        # In fill-only mode, skip if orders are already on the book
+        if self.config.refresh_on_fill_only and has_active:
+            return
+
         if self.current_timestamp < self._refresh_timestamp:
             return
 
@@ -394,25 +398,7 @@ class DeltaDefiAMM(ScriptStrategyBase):
             self._cancel_all_orders()
             return True
 
-        # 3. Tapster gone — book spread blown out → pause
-        spread_bps = self._get_book_spread_bps()
-        if spread_bps is not None and spread_bps > self.config.max_book_spread_bps:
-            self.logger().warning(f"Book spread {spread_bps:.0f} bps > limit {self.config.max_book_spread_bps}. Pausing.")
-            self._cancel_all_orders()
-            return True
-
-        # 4. Pool/book divergence monitor (enhancement)
-        if self.config.enable_book_divergence_monitor:
-            book_mid = self._get_book_mid()
-            if book_mid is not None:
-                pool_mid = self.pool.get_mid_price()
-                div_bps = abs(pool_mid - book_mid) / book_mid * D("10000")
-                if div_bps > self.config.book_divergence_cancel_bps:
-                    self.logger().warning(f"Pool/book divergence {div_bps:.0f} bps. Cancelling.")
-                    self._cancel_all_orders()
-                    return True
-
-        # 5. Fill velocity (enhancement)
+        # 3. Fill velocity (enhancement)
         if self.config.enable_fill_velocity_detector:
             now = time.time()
             window = self.config.fill_velocity_window_sec
@@ -532,18 +518,6 @@ class DeltaDefiAMM(ScriptStrategyBase):
             return mid if mid is not None and mid > ZERO else None
         except Exception:
             return None
-
-    def _get_book_spread_bps(self) -> Optional[Decimal]:
-        try:
-            connector = self.connectors[self.config.exchange]
-            ask = connector.get_price(self.config.trading_pair, True)
-            bid = connector.get_price(self.config.trading_pair, False)
-            if ask > ZERO and bid > ZERO:
-                mid = (ask + bid) / D(2)
-                return (ask - bid) / mid * D("10000")
-        except Exception:
-            pass
-        return None
 
     # ---- State persistence ------------------------------------------------
 
