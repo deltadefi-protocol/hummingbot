@@ -42,7 +42,7 @@ class DeltaDefiAMMConfig(BaseClientModel):
     script_file_name: str = os.path.basename(__file__)
     # Required (must set per pair)
     exchange: str = Field("deltadefi")
-    trading_pair: str = Field(default="IAG-USDM")
+    trading_pair: str = Field(default="ADA-USDM")
     initial_price: Optional[Decimal] = Field(default=None)
     pool_depth: Optional[Decimal] = Field(default=None)
     base_spread_bps: Decimal = Field(D("40"))
