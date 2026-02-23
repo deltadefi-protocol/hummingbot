@@ -648,9 +648,9 @@ class DeltadefiExchange(ExchangePyBase):
                 operation_key = decrypt_with_cipher(encrypted_key, self.deltadefi_password)
                 self._operation_wallet = Wallet.new_root_key(operation_key)
                 self.logger().info("Operation wallet initialized successfully for transaction signing")
-            except ImportError:
+            except ImportError as e:
                 self.logger().warning(
-                    "sidan-gin package not installed. Transaction signing will not be available. "
+                    f"sidan-gin import failed: {e}. Transaction signing will not be available. "
                     "Install with: pip install sidan-gin"
                 )
             except Exception as e:
