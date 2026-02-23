@@ -532,16 +532,25 @@ class DeltadefiExchange(ExchangePyBase):
                 sub_type = stream_message.get("sub_type", "")
 
                 if msg_type == "Account" and sub_type == "order_info":
-                    data = stream_message.get("data", stream_message)
+                    # WS payload: {"type":"Account","sub_type":"order_info","order":{...}}
+                    data = stream_message.get("order", stream_message.get("data", stream_message))
                     order_status = CONSTANTS.ORDER_STATE.get(data.get("status", ""), OrderState.OPEN)
-                    client_order_id = data.get("client_order_id", "")
-                    fillable_order = self._order_tracker.all_fillable_orders.get(client_order_id)
-                    updatable_order = self._order_tracker.all_updatable_orders.get(client_order_id)
+                    exchange_order_id = str(data.get("id", ""))
+
+                    # DeltaDeFi WS doesn't include client_order_id — match by exchange_order_id
+                    fillable_order = None
+                    updatable_order = None
+                    for o in self._order_tracker.all_fillable_orders.values():
+                        if o.exchange_order_id == exchange_order_id:
+                            fillable_order = o
+                            break
+                    for o in self._order_tracker.all_updatable_orders.values():
+                        if o.exchange_order_id == exchange_order_id:
+                            updatable_order = o
+                            break
 
                     if (fillable_order is not None
                             and order_status in [OrderState.PARTIALLY_FILLED, OrderState.FILLED]):
-                        # Fetch fill details via REST — websocket order_info
-                        # messages may not include trade_id or fill amounts
                         try:
                             trade_updates = await self._all_trade_updates_for_order(fillable_order)
                             for trade_update in trade_updates:
@@ -553,7 +562,7 @@ class DeltadefiExchange(ExchangePyBase):
                                     )
                         except Exception:
                             self.logger().debug(
-                                f"Failed to fetch fill details for {client_order_id} via REST"
+                                f"Failed to fetch fill details for {exchange_order_id} via REST"
                             )
 
                     if updatable_order is not None:
@@ -562,7 +571,7 @@ class DeltadefiExchange(ExchangePyBase):
                             update_timestamp=self._parse_order_timestamp(data),
                             new_state=order_status,
                             client_order_id=updatable_order.client_order_id,
-                            exchange_order_id=str(data.get("order_id", "")),
+                            exchange_order_id=exchange_order_id,
                         )
                         self._order_tracker.process_order_update(order_update=order_update)
 
@@ -669,10 +678,16 @@ class DeltadefiExchange(ExchangePyBase):
                     is_auth_required=True,
                     limit_id=CONSTANTS.CANCEL_ALL_PATH,
                 )
-            results = [CancellationResult(o.client_order_id, True) for o in incomplete_orders]
+            # Fire proper OrderUpdate so the strategy-level tracker also removes the orders
             for o in incomplete_orders:
-                self.stop_tracking_order(o.client_order_id)
-            return results
+                self._order_tracker.process_order_update(OrderUpdate(
+                    client_order_id=o.client_order_id,
+                    exchange_order_id=o.exchange_order_id or "",
+                    trading_pair=o.trading_pair,
+                    update_timestamp=self.current_timestamp,
+                    new_state=OrderState.CANCELED,
+                ))
+            return [CancellationResult(o.client_order_id, True) for o in incomplete_orders]
         except Exception:
             self.logger().network("Error in batch cancel-all.", exc_info=True)
             return [CancellationResult(o.client_order_id, False) for o in incomplete_orders]
@@ -699,7 +714,7 @@ class DeltadefiExchange(ExchangePyBase):
     async def _reconciliation_loop(self):
         while True:
             try:
-                await self._sleep(30.0)
+                await self._sleep(10.0)
                 await self._reconcile_orders()
                 await self._reconcile_balances()
             except asyncio.CancelledError:
@@ -731,7 +746,7 @@ class DeltadefiExchange(ExchangePyBase):
                     self.logger().debug(f"Could not fetch open orders for {trading_pair}")
             exchange_orders = all_exchange_orders
 
-            for client_order_id, tracked_order in self._order_tracker.active_orders.items():
+            for client_order_id, tracked_order in list(self._order_tracker.active_orders.items()):
                 if client_order_id not in exchange_orders:
                     if tracked_order.is_open:
                         exchange_order_id = tracked_order.exchange_order_id or ""
@@ -748,6 +763,18 @@ class DeltadefiExchange(ExchangePyBase):
                                 order_data.get("status", ""), OrderState.OPEN
                             )
                             if new_state != tracked_order.current_state:
+                                # Fetch fill details before updating state so the
+                                # order tracker receives TradeUpdates before the
+                                # state transition fires CompletedEvent.
+                                if new_state in (OrderState.PARTIALLY_FILLED, OrderState.FILLED):
+                                    try:
+                                        trade_updates = await self._all_trade_updates_for_order(tracked_order)
+                                        for tu in trade_updates:
+                                            self._order_tracker.process_trade_update(tu)
+                                    except Exception:
+                                        self.logger().debug(
+                                            f"Reconciliation: could not fetch fills for {client_order_id}"
+                                        )
                                 order_update = OrderUpdate(
                                     client_order_id=client_order_id,
                                     exchange_order_id=exchange_order_id,
