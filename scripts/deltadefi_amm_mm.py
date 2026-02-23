@@ -21,9 +21,9 @@ D = Decimal
 ZERO = D("0")
 
 PAIR_PRESETS = {
-    "ADA-USDM": {"initial_price": D("0.27"), "pool_depth": D("17000")},
-    "IAG-USDM": {"initial_price": D("0.26"), "pool_depth": D("10000")},
-    "NIGHT-USDM": {"initial_price": D("0.0001"), "pool_depth": D("5000")},
+    "ADA-USDM": {"initial_price": D("0.27")},
+    "IAG-USDM": {"initial_price": D("0.26")},
+    "NIGHT-USDM": {"initial_price": D("0.0001")},
 }
 
 
@@ -44,7 +44,8 @@ class DeltaDefiAMMConfig(BaseClientModel):
     exchange: str = Field("deltadefi")
     trading_pair: str = Field(default="ADA-USDM")
     initial_price: Optional[Decimal] = Field(default=None)
-    pool_depth: Optional[Decimal] = Field(default=None)
+    max_pool_depth: Optional[Decimal] = Field(D("10000"))
+    min_pool_depth: Optional[Decimal] = Field(default=None)
     base_spread_bps: Decimal = Field(D("40"))
     max_cumulative_loss: Decimal = Field(D("500"))
     min_base_balance: Decimal = Field(D("1000"))
@@ -77,8 +78,6 @@ class DeltaDefiAMMConfig(BaseClientModel):
         preset = PAIR_PRESETS.get(self.trading_pair, {})
         if self.initial_price is None:
             self.initial_price = preset.get("initial_price", D("0.01"))
-        if self.pool_depth is None:
-            self.pool_depth = preset.get("pool_depth", D("5000"))
         return self
 
 
@@ -219,6 +218,7 @@ class DeltaDefiAMM(ScriptStrategyBase):
     _last_rebalance: float = 0
     _stopped: bool = False
     _refreshing: bool = False
+    _pool_scaled: bool = False
 
     @classmethod
     def init_markets(cls, config: DeltaDefiAMMConfig):
@@ -239,13 +239,10 @@ class DeltaDefiAMM(ScriptStrategyBase):
             self._quote_flow = D(str(state.get("quote_flow", "0")))
             self.logger().info(f"Restored pool state from {self._state_file}")
         else:
-            self.pool = VirtualPool(self.config.initial_price, self.config.pool_depth, self.config.amplification)
+            # First run: pool will be initialized from real balance on first tick
+            self.pool = None
             self._base_flow = ZERO
             self._quote_flow = ZERO
-            self.logger().info(
-                f"Initialized new pool: {self.config.trading_pair} @ {self.config.initial_price} "
-                f"depth={self.config.pool_depth}"
-            )
 
         self.balance_gate = BalanceGate(connectors[self.config.exchange], self.config)
         self._recent_fills: deque = deque()
@@ -260,6 +257,13 @@ class DeltaDefiAMM(ScriptStrategyBase):
         connector = self.connectors[self.config.exchange]
         if self.config.trading_pair not in connector.trading_rules:
             return
+
+        # Initialize or auto-scale pool on first tick (balances available now)
+        if self.pool is None:
+            if not self._init_pool_from_balance():
+                return
+        elif not self._pool_scaled:
+            self._auto_scale_pool()
 
         if self._check_circuit_breakers():
             return
@@ -485,7 +489,7 @@ class DeltaDefiAMM(ScriptStrategyBase):
             connector = self.connectors[self.config.exchange]
             await connector.cancel_all(timeout_seconds=10.0)
 
-            mid = self._get_book_mid() or self.pool.get_mid_price()
+            mid = self.pool.get_mid_price()
             RateOracle.get_instance().set_price(self.config.trading_pair, mid)
             base_avail, quote_avail = self.pool.get_available_reserves(self.config.floor_ratio)
             orders = self._generate_orders(mid, base_avail, quote_avail)
@@ -514,6 +518,70 @@ class DeltaDefiAMM(ScriptStrategyBase):
             return mid if mid is not None and mid > ZERO else None
         except Exception:
             return None
+
+    # ---- Pool auto-scaling ------------------------------------------------
+
+    def _cap_pool_depth(self, depth: Decimal) -> Decimal:
+        """Clamp pool depth to [min_pool_depth, max_pool_depth] if configured."""
+        if self.config.min_pool_depth is not None and depth < self.config.min_pool_depth:
+            depth = self.config.min_pool_depth
+        if self.config.max_pool_depth is not None and depth > self.config.max_pool_depth:
+            depth = self.config.max_pool_depth
+        return depth
+
+    def _init_pool_from_balance(self) -> bool:
+        """First run: create pool from real account balance."""
+        real_base, real_quote = self.balance_gate.get_real_balances()
+        if real_base <= ZERO or real_quote <= ZERO:
+            return False
+        mid = self._get_book_mid()
+        if mid is None or mid <= ZERO:
+            mid = self.config.initial_price
+        pool_depth = self._cap_pool_depth(real_base * mid + real_quote)
+        self.pool = VirtualPool(mid, pool_depth, self.config.amplification)
+        self._pool_scaled = True
+        self._save_state()
+        self.logger().info(
+            f"Initialized pool from account balance: "
+            f"{self.config.trading_pair} @ {mid} depth={pool_depth:.0f}"
+        )
+        return True
+
+    def _auto_scale_pool(self):
+        """Scale virtual pool to match real account balance on restart.
+        Preserves inventory ratio (skew) and P&L flows."""
+        self._pool_scaled = True
+        real_base, real_quote = self.balance_gate.get_real_balances()
+        if real_base <= ZERO or real_quote <= ZERO:
+            return
+        mid = self._get_book_mid() or self.pool.get_mid_price()
+        if mid is None or mid <= ZERO:
+            return
+
+        real_total = real_base * mid + real_quote
+        target_depth = self._cap_pool_depth(real_total)
+        pool_total = self.pool.initial_base * mid + self.pool.initial_quote
+        if pool_total <= ZERO:
+            return
+
+        scale = target_depth / pool_total
+        # Only scale if difference is meaningful (>5%)
+        if abs(scale - D(1)) < D("0.05"):
+            return
+
+        old_depth = self.pool.initial_quote
+        self.pool.initial_base *= scale
+        self.pool.initial_quote *= scale
+        self.pool.base *= scale
+        self.pool.quote *= scale
+        self.pool.k = self.pool.base * self.pool.quote
+        self._base_flow *= scale
+        self._quote_flow *= scale
+        self._save_state()
+        self.logger().info(
+            f"Auto-scaled pool to account balance: "
+            f"{old_depth:.0f} → {self.pool.initial_quote:.0f} ({scale:.2f}x)"
+        )
 
     # ---- State persistence ------------------------------------------------
 
