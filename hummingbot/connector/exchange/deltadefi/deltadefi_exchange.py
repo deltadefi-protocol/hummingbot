@@ -663,6 +663,33 @@ class DeltadefiExchange(ExchangePyBase):
         except Exception:
             self.logger().exception("Error fetching operation key. Transaction signing may not work.")
 
+    async def cancel_all(self, timeout_seconds: float = 10.0):
+        """Cancel all open orders using the batch cancel-all endpoint.
+        Overrides the base class one-by-one implementation."""
+        incomplete_orders = [o for o in self.in_flight_orders.values() if not o.is_done]
+        if not incomplete_orders:
+            return []
+
+        from hummingbot.core.data_type.cancellation_result import CancellationResult
+
+        try:
+            for trading_pair in (self._trading_pairs or []):
+                exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+                await self._api_request(
+                    path_url=CONSTANTS.CANCEL_ALL_PATH,
+                    method=RESTMethod.POST,
+                    data={"symbol": exchange_symbol},
+                    is_auth_required=True,
+                    limit_id=CONSTANTS.CANCEL_ALL_PATH,
+                )
+            results = [CancellationResult(o.client_order_id, True) for o in incomplete_orders]
+            for o in incomplete_orders:
+                self.stop_tracking_order(o.client_order_id)
+            return results
+        except Exception:
+            self.logger().network("Error in batch cancel-all.", exc_info=True)
+            return [CancellationResult(o.client_order_id, False) for o in incomplete_orders]
+
     async def _cancel_all_on_exchange(self):
         """Cancel all open orders on the exchange for configured trading pairs.
         Called on startup to clean up orphans from previous sessions."""

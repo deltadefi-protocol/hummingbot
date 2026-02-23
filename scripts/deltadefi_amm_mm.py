@@ -13,6 +13,7 @@ from hummingbot.client.config.config_data_types import BaseClientModel
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.event.events import OrderFilledEvent
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.strategy.script_strategy_base import ScriptStrategyBase
 
 D = Decimal
@@ -376,8 +377,15 @@ class DeltaDefiAMM(ScriptStrategyBase):
                 self.buy(self.config.exchange, self.config.trading_pair, o.size, OrderType.LIMIT, o.price)
 
     def _cancel_all_orders(self):
-        for order in self.get_active_orders(connector_name=self.config.exchange):
-            self.cancel(self.config.exchange, order.trading_pair, order.client_order_id)
+        safe_ensure_future(self._cancel_all_orders_async())
+
+    async def _cancel_all_orders_async(self):
+        connector = self.connectors[self.config.exchange]
+        await connector.cancel_all(timeout_seconds=10.0)
+        remaining = self.get_active_orders(connector_name=self.config.exchange)
+        if remaining:
+            self.logger().info(f"Retry cancel: {len(remaining)} orders still active after cancel-all")
+            await connector.cancel_all(timeout_seconds=10.0)
 
     # ---- Circuit breakers -------------------------------------------------
 
