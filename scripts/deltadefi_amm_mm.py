@@ -21,7 +21,7 @@ D = Decimal
 ZERO = D("0")
 
 PAIR_PRESETS = {
-    "ADA-USDM": {"initial_price": D("0.2762"), "pool_depth": D("17000")},
+    "ADA-USDM": {"initial_price": D("0.27"), "pool_depth": D("17000")},
     "IAG-USDM": {"initial_price": D("0.26"), "pool_depth": D("10000")},
     "NIGHT-USDM": {"initial_price": D("0.0001"), "pool_depth": D("5000")},
 }
