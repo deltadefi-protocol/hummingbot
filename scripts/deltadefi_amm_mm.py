@@ -45,8 +45,8 @@ class DeltaDefiAMMConfig(BaseClientModel):
     trading_pair: str = Field(default="IAG-USDM")
     initial_price: Optional[Decimal] = Field(default=None)
     pool_depth: Optional[Decimal] = Field(default=None)
-    base_spread_bps: Decimal = Field(D("100"))
-    max_cumulative_loss: Decimal = Field(D("100"))
+    base_spread_bps: Decimal = Field(D("40"))
+    max_cumulative_loss: Decimal = Field(D("500"))
     min_base_balance: Decimal = Field(D("1000"))
     min_quote_balance: Decimal = Field(D("500"))
     # Optional (hardcode defaults, overridable in config)
@@ -218,6 +218,7 @@ class DeltaDefiAMM(ScriptStrategyBase):
     _refresh_timestamp: float = 0
     _last_rebalance: float = 0
     _stopped: bool = False
+    _refreshing: bool = False
 
     @classmethod
     def init_markets(cls, config: DeltaDefiAMMConfig):
@@ -265,25 +266,18 @@ class DeltaDefiAMM(ScriptStrategyBase):
 
         has_active = bool(self.get_active_orders(connector_name=self.config.exchange))
 
-        # In fill-only mode, skip if orders are on the book, no fill pending,
-        # and refresh timeout hasn't been reached.
-        # _refresh_timestamp == 0 means a fill just happened and we need to requote.
-        # Once _refresh_timestamp is exceeded, force a requote as a safety net
-        # (handles partial placements from rate limits, stale orders, etc.)
-        if self.config.refresh_on_fill_only and has_active and self._refresh_timestamp > 0:
+        if self.config.refresh_on_fill_only:
+            # Fill-only mode: _refresh_after_fill handles requote on fills.
+            # on_tick only places initial orders when nothing is on the book.
+            if has_active:
+                return
+        else:
+            # Timer mode: wait for order_refresh_time before refreshing.
             if self.current_timestamp < self._refresh_timestamp:
                 return
-
-        if self.current_timestamp < self._refresh_timestamp:
-            return
-
-        # Two-phase refresh: cancel first, place on next tick once cleared.
-        # This prevents snowballing orders when async cancels haven't confirmed.
-        if has_active:
-            self._cancel_all_orders()
-            # Allow up to order_refresh_time for cancels to confirm before retrying
-            self._refresh_timestamp = self.current_timestamp + self.config.order_refresh_time
-            return
+            if has_active:
+                self._cancel_all_orders()
+                return
 
         mid = self._get_book_mid() or self.pool.get_mid_price()
         RateOracle.get_instance().set_price(self.config.trading_pair, mid)
@@ -479,9 +473,29 @@ class DeltaDefiAMM(ScriptStrategyBase):
         self.log_with_clock(logging.INFO, msg)
         self.notify_hb_app_with_timestamp(msg)
 
-        # Cancel stale orders — next on_tick will requote once cancels confirm
-        self._cancel_all_orders()
-        self._refresh_timestamp = 0
+        # Cancel remaining orders and requote immediately with updated pool
+        safe_ensure_future(self._refresh_after_fill())
+
+    async def _refresh_after_fill(self):
+        """Await batch cancel, then immediately place fresh orders from updated pool."""
+        if self._refreshing:
+            return
+        self._refreshing = True
+        try:
+            connector = self.connectors[self.config.exchange]
+            await connector.cancel_all(timeout_seconds=10.0)
+
+            mid = self._get_book_mid() or self.pool.get_mid_price()
+            RateOracle.get_instance().set_price(self.config.trading_pair, mid)
+            base_avail, quote_avail = self.pool.get_available_reserves(self.config.floor_ratio)
+            orders = self._generate_orders(mid, base_avail, quote_avail)
+            orders = self.balance_gate.scale_orders(orders)
+            self._place_orders(orders)
+            self._refresh_timestamp = self.current_timestamp + self.config.order_refresh_time
+        except Exception:
+            self.logger().network("Error in refresh after fill.", exc_info=True)
+        finally:
+            self._refreshing = False
 
     # ---- P&L --------------------------------------------------------------
 
