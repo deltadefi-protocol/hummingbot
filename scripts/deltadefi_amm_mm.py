@@ -97,6 +97,7 @@ class VirtualPool:
         self.quote = self.initial_quote
         self.k = self.base * self.quote
         self.amplification = D(str(amplification))
+        self.anchor_price = D(str(initial_price))
 
     @classmethod
     def from_state(cls, state: dict) -> "VirtualPool":
@@ -107,6 +108,11 @@ class VirtualPool:
         pool.quote = D(str(state["quote"]))
         pool.k = D(str(state["k"]))
         pool.amplification = D(str(state["amplification"]))
+        # Migration: old state files lack anchor_price — fall back to initial_price
+        if "anchor_price" in state:
+            pool.anchor_price = D(str(state["anchor_price"]))
+        else:
+            pool.anchor_price = pool.initial_quote / pool.initial_base
         return pool
 
     def to_state(self) -> dict:
@@ -117,15 +123,15 @@ class VirtualPool:
             "quote": str(self.quote),
             "k": str(self.k),
             "amplification": str(self.amplification),
+            "anchor_price": str(self.anchor_price),
         }
 
     def get_mid_price(self) -> Decimal:
         if self.base <= ZERO:
-            return self.quote
+            return self.anchor_price
         inventory_ratio = self.base / self.initial_base
-        raw_adj = D(1) / inventory_ratio
-        dampened_adj = D(1) + (raw_adj - D(1)) / self.amplification
-        return (self.quote / self.base) * dampened_adj
+        shift = (D(1) / inventory_ratio - D(1)) / self.amplification
+        return self.anchor_price * (D(1) + shift)
 
     def update_on_fill(self, side: TradeType, amount: Decimal):
         filled = D(str(amount))
@@ -283,7 +289,10 @@ class DeltaDefiAMM(ScriptStrategyBase):
                 self._cancel_all_orders()
                 return
 
-        mid = self._get_book_mid() or self.pool.get_mid_price()
+        book_mid = self._get_book_mid()
+        if book_mid:
+            self.pool.anchor_price = book_mid
+        mid = self.pool.get_mid_price()
         RateOracle.get_instance().set_price(self.config.trading_pair, mid)
         base_avail, quote_avail = self.pool.get_available_reserves(self.config.floor_ratio)
 
@@ -487,6 +496,12 @@ class DeltaDefiAMM(ScriptStrategyBase):
         self._refreshing = True
         try:
             connector = self.connectors[self.config.exchange]
+
+            # Update anchor BEFORE cancelling — after cancel, book may be thin
+            book_mid = self._get_book_mid()
+            if book_mid:
+                self.pool.anchor_price = book_mid
+
             await connector.cancel_all(timeout_seconds=10.0)
 
             mid = self.pool.get_mid_price()
@@ -554,7 +569,10 @@ class DeltaDefiAMM(ScriptStrategyBase):
         real_base, real_quote = self.balance_gate.get_real_balances()
         if real_base <= ZERO or real_quote <= ZERO:
             return
-        mid = self._get_book_mid() or self.pool.get_mid_price()
+        book_mid = self._get_book_mid()
+        if book_mid:
+            self.pool.anchor_price = book_mid
+        mid = self.pool.get_mid_price()
         if mid is None or mid <= ZERO:
             return
 
