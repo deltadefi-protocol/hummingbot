@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -274,6 +275,11 @@ class DeltaDefiAMM(ScriptStrategyBase):
         if self._check_circuit_breakers():
             return
 
+        # Don't place orders while _refresh_after_fill is in progress —
+        # doing so creates duplicate sets that can cross and self-trade.
+        if self._refreshing:
+            return
+
         has_active = bool(self.get_active_orders(connector_name=self.config.exchange))
 
         if self.config.refresh_on_fill_only:
@@ -367,12 +373,15 @@ class DeltaDefiAMM(ScriptStrategyBase):
 
     # ---- Order execution --------------------------------------------------
 
-    def _place_orders(self, orders: List[OrderProposal]):
+    def _place_orders(self, orders: List[OrderProposal]) -> List[str]:
+        order_ids = []
         for o in orders:
             if o.side == TradeType.SELL:
-                self.sell(self.config.exchange, self.config.trading_pair, o.size, OrderType.LIMIT, o.price)
+                oid = self.sell(self.config.exchange, self.config.trading_pair, o.size, OrderType.LIMIT, o.price)
             else:
-                self.buy(self.config.exchange, self.config.trading_pair, o.size, OrderType.LIMIT, o.price)
+                oid = self.buy(self.config.exchange, self.config.trading_pair, o.size, OrderType.LIMIT, o.price)
+            order_ids.append(oid)
+        return order_ids
 
     def _cancel_all_orders(self):
         safe_ensure_future(self._cancel_all_orders_async())
@@ -380,6 +389,18 @@ class DeltaDefiAMM(ScriptStrategyBase):
     async def _cancel_all_orders_async(self):
         connector = self.connectors[self.config.exchange]
         await connector.cancel_all(timeout_seconds=10.0)
+
+    async def _await_order_confirmations(self, order_ids: List[str], timeout: float = 10.0):
+        """Wait until all orders have exchange_order_ids (submitted to exchange)."""
+        connector = self.connectors[self.config.exchange]
+        for oid in order_ids:
+            tracked = connector.in_flight_orders.get(oid)
+            if tracked is None:
+                continue
+            try:
+                await asyncio.wait_for(tracked.get_exchange_order_id(), timeout=timeout)
+            except (asyncio.TimeoutError, Exception):
+                pass
 
     # ---- Circuit breakers -------------------------------------------------
 
@@ -502,15 +523,27 @@ class DeltaDefiAMM(ScriptStrategyBase):
             if book_mid:
                 self.pool.anchor_price = book_mid
 
-            await connector.cancel_all(timeout_seconds=10.0)
+            results = await connector.cancel_all(timeout_seconds=10.0)
+
+            # Abort if cancel failed — old orders are still live on exchange;
+            # placing new orders would create duplicates that can self-trade.
+            if results and any(not r.success for r in results):
+                self.logger().warning("cancel_all had failures — skipping requote to avoid duplicate orders.")
+                return
 
             mid = self.pool.get_mid_price()
             RateOracle.get_instance().set_price(self.config.trading_pair, mid)
             base_avail, quote_avail = self.pool.get_available_reserves(self.config.floor_ratio)
             orders = self._generate_orders(mid, base_avail, quote_avail)
             orders = self.balance_gate.scale_orders(orders)
-            self._place_orders(orders)
+            order_ids = self._place_orders(orders)
             self._refresh_timestamp = self.current_timestamp + self.config.order_refresh_time
+
+            # Wait for orders to reach the exchange before releasing _refreshing.
+            # Without this, a rapid fill can trigger a new refresh cycle while
+            # these orders are still in the build/sign/submit pipeline, causing
+            # duplicate orders that cross and self-trade.
+            await self._await_order_confirmations(order_ids)
         except Exception:
             self.logger().network("Error in refresh after fill.", exc_info=True)
         finally:
