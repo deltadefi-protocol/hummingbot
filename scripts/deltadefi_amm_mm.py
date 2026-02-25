@@ -53,10 +53,10 @@ class DeltaDefiAMMConfig(BaseClientModel):
     min_quote_balance: Decimal = Field(D("500"))
     # Optional (hardcode defaults, overridable in config)
     amplification: Decimal = Field(D("20"))
-    num_levels: int = Field(3)
-    size_decay: Decimal = Field(D("0.7"))
+    num_levels: int = Field(1)
+    size_decay: Decimal = Field(D("0.85"))
     spread_multiplier: Decimal = Field(D("1.5"))
-    order_amount_pct: Decimal = Field(D("0.015"))
+    order_amount_pct: Decimal = Field(D("0.05"))
     order_refresh_time: int = Field(5)
     refresh_on_fill_only: bool = Field(True)
     floor_ratio: Decimal = Field(D("0.30"))
@@ -306,7 +306,7 @@ class DeltaDefiAMM(ScriptStrategyBase):
         orders = self.balance_gate.scale_orders(orders)
         self._place_orders(orders)
 
-        self._check_rebalance()
+        safe_ensure_future(self._check_rebalance())
         self._refresh_timestamp = self.current_timestamp + self.config.order_refresh_time
 
     # ---- Order generation -------------------------------------------------
@@ -438,7 +438,7 @@ class DeltaDefiAMM(ScriptStrategyBase):
 
     # ---- Rebalance --------------------------------------------------------
 
-    def _check_rebalance(self):
+    async def _check_rebalance(self):
         if time.time() - self._last_rebalance < self.config.rebalance_cooldown:
             return
 
@@ -468,6 +468,15 @@ class DeltaDefiAMM(ScriptStrategyBase):
         rebalance_amount = connector.quantize_order_amount(self.config.trading_pair, rebalance_amount)
         if rebalance_amount <= ZERO:
             return
+
+        # Ensure all existing orders are cancelled before placing rebalance MARKET order.
+        # Without this, the MARKET order can land while stale LIMIT orders are still live.
+        active_orders = self.get_active_orders(connector_name=self.config.exchange)
+        if active_orders:
+            results = await connector.cancel_all(timeout_seconds=10.0)
+            if results and any(not r.success for r in results):
+                self.logger().warning("Rebalance aborted — cancel_all failed, orders still live on exchange.")
+                return
 
         self.logger().info(f"Rebalance: {side.name} {rebalance_amount} (divergence: {divergence:.4f})")
         if side == TradeType.BUY:

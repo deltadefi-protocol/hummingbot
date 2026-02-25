@@ -666,36 +666,50 @@ class DeltadefiExchange(ExchangePyBase):
 
     async def cancel_all(self, timeout_seconds: float = 10.0):
         """Cancel all open orders using the batch cancel-all endpoint.
-        Overrides the base class one-by-one implementation."""
+        Overrides the base class one-by-one implementation.
+        Retries with exponential backoff on 429 rate-limit errors."""
         incomplete_orders = [o for o in self.in_flight_orders.values() if not o.is_done]
         if not incomplete_orders:
             return []
 
         from hummingbot.core.data_type.cancellation_result import CancellationResult
 
-        try:
-            for trading_pair in (self._trading_pairs or []):
-                exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
-                await self._api_request(
-                    path_url=CONSTANTS.CANCEL_ALL_PATH,
-                    method=RESTMethod.POST,
-                    data={"symbol": exchange_symbol},
-                    is_auth_required=True,
-                    limit_id=CONSTANTS.CANCEL_ALL_PATH,
-                )
-            # Fire proper OrderUpdate so the strategy-level tracker also removes the orders
-            for o in incomplete_orders:
-                self._order_tracker.process_order_update(OrderUpdate(
-                    client_order_id=o.client_order_id,
-                    exchange_order_id=o.exchange_order_id or "",
-                    trading_pair=o.trading_pair,
-                    update_timestamp=self.current_timestamp,
-                    new_state=OrderState.CANCELED,
-                ))
-            return [CancellationResult(o.client_order_id, True) for o in incomplete_orders]
-        except Exception:
-            self.logger().network("Error in batch cancel-all.", exc_info=True)
-            return [CancellationResult(o.client_order_id, False) for o in incomplete_orders]
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                for trading_pair in (self._trading_pairs or []):
+                    exchange_symbol = await self.exchange_symbol_associated_to_pair(trading_pair)
+                    await self._api_request(
+                        path_url=CONSTANTS.CANCEL_ALL_PATH,
+                        method=RESTMethod.POST,
+                        data={"symbol": exchange_symbol},
+                        is_auth_required=True,
+                        limit_id=CONSTANTS.CANCEL_ALL_PATH,
+                    )
+                # Fire proper OrderUpdate so the strategy-level tracker also removes the orders
+                for o in incomplete_orders:
+                    self._order_tracker.process_order_update(OrderUpdate(
+                        client_order_id=o.client_order_id,
+                        exchange_order_id=o.exchange_order_id or "",
+                        trading_pair=o.trading_pair,
+                        update_timestamp=self.current_timestamp,
+                        new_state=OrderState.CANCELED,
+                    ))
+                return [CancellationResult(o.client_order_id, True) for o in incomplete_orders]
+            except IOError as e:
+                if "429" in str(e) and attempt < max_retries - 1:
+                    wait = 0.5 * (2 ** attempt)
+                    self.logger().warning(
+                        f"cancel_all rate-limited (429), retrying in {wait}s "
+                        f"(attempt {attempt + 1}/{max_retries})"
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+                self.logger().network("Error in batch cancel-all.", exc_info=True)
+                return [CancellationResult(o.client_order_id, False) for o in incomplete_orders]
+            except Exception:
+                self.logger().network("Error in batch cancel-all.", exc_info=True)
+                return [CancellationResult(o.client_order_id, False) for o in incomplete_orders]
 
     async def _cancel_all_on_exchange(self):
         """Cancel all open orders on the exchange for configured trading pairs.
