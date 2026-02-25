@@ -22,7 +22,7 @@ D = Decimal
 ZERO = D("0")
 
 PAIR_PRESETS = {
-    "ADA-USDM": {"initial_price": D("0.27")},
+    "ADA-USDM": {"initial_price": D("0.2649")},
     "IAG-USDM": {"initial_price": D("0.26")},
     "NIGHT-USDM": {"initial_price": D("0.0001")},
 }
@@ -45,9 +45,9 @@ class DeltaDefiAMMConfig(BaseClientModel):
     exchange: str = Field("deltadefi")
     trading_pair: str = Field(default="ADA-USDM")
     initial_price: Optional[Decimal] = Field(default=None)
-    max_pool_depth: Optional[Decimal] = Field(D("10000"))
-    min_pool_depth: Optional[Decimal] = Field(default=None)
-    base_spread_bps: Decimal = Field(D("40"))
+    max_pool_depth: Optional[Decimal] = Field(D("50000"))
+    min_pool_depth: Optional[Decimal] = Field(default=D("50000"))
+    base_spread_bps: Decimal = Field(D("20"))
     max_cumulative_loss: Decimal = Field(D("500"))
     min_base_balance: Decimal = Field(D("1000"))
     min_quote_balance: Decimal = Field(D("500"))
@@ -56,7 +56,7 @@ class DeltaDefiAMMConfig(BaseClientModel):
     num_levels: int = Field(1)
     size_decay: Decimal = Field(D("0.85"))
     spread_multiplier: Decimal = Field(D("1.5"))
-    order_amount_pct: Decimal = Field(D("0.05"))
+    order_amount_pct: Decimal = Field(D("0.005"))
     order_refresh_time: int = Field(5)
     refresh_on_fill_only: bool = Field(True)
     floor_ratio: Decimal = Field(D("0.30"))
@@ -65,7 +65,7 @@ class DeltaDefiAMMConfig(BaseClientModel):
     rebalance_cooldown: int = Field(60)
     min_both_sides_pct: Decimal = Field(D("0.40"))
     # Enhancement flags
-    enable_fill_velocity_detector: bool = Field(False)
+    enable_fill_velocity_detector: bool = Field(True)
     fill_velocity_window_sec: int = Field(10)
     fill_velocity_max_same_side: int = Field(3)
     enable_asymmetric_spread: bool = Field(False)
@@ -73,12 +73,19 @@ class DeltaDefiAMMConfig(BaseClientModel):
     min_spread_bps: Decimal = Field(D("20"))
     enable_order_randomization: bool = Field(False)
     randomization_pct: Decimal = Field(D("0.15"))
+    # Hybrid pricing: PMM ↔ AMM blend
+    pool_price_weight: Decimal = Field(D("0.70"))   # 0=pure PMM (anchor), 1=pure AMM (k-price)
+    anchor_ema_alpha: Decimal = Field(D("0.05"))     # EMA smoothing for anchor tracking
 
     @model_validator(mode="after")
     def apply_pair_presets(self):
         preset = PAIR_PRESETS.get(self.trading_pair, {})
         if self.initial_price is None:
             self.initial_price = preset.get("initial_price", D("0.01"))
+        if not (ZERO <= self.pool_price_weight <= D(1)):
+            raise ValueError("pool_price_weight must be in [0, 1]")
+        if not (ZERO < self.anchor_ema_alpha <= D(1)):
+            raise ValueError("anchor_ema_alpha must be in (0, 1]")
         return self
 
 
@@ -127,12 +134,25 @@ class VirtualPool:
             "anchor_price": str(self.anchor_price),
         }
 
-    def get_mid_price(self) -> Decimal:
+    def get_mid_price(self, pool_price_weight: Decimal = ZERO) -> Decimal:
         if self.base <= ZERO:
             return self.anchor_price
+        pool_price = self.quote / self.base
+        if pool_price_weight >= D(1):
+            return pool_price
+        # Inventory-shifted anchor (PMM component)
         inventory_ratio = self.base / self.initial_base
         shift = (D(1) / inventory_ratio - D(1)) / self.amplification
-        return self.anchor_price * (D(1) + shift)
+        anchor_mid = self.anchor_price * (D(1) + shift)
+        if pool_price_weight <= ZERO:
+            return anchor_mid
+        # Blend: (1-w)*anchor_mid + w*pool_price
+        return (D(1) - pool_price_weight) * anchor_mid + pool_price_weight * pool_price
+
+    def get_pool_price(self) -> Optional[Decimal]:
+        if self.base <= ZERO:
+            return None
+        return self.quote / self.base
 
     def update_on_fill(self, side: TradeType, amount: Decimal):
         filled = D(str(amount))
@@ -297,10 +317,10 @@ class DeltaDefiAMM(ScriptStrategyBase):
 
         book_mid = self._get_book_mid()
         if book_mid:
-            self.pool.anchor_price = book_mid
-        mid = self.pool.get_mid_price()
+            self._update_anchor_ema(book_mid)
+        mid = self.pool.get_mid_price(self.config.pool_price_weight)
         RateOracle.get_instance().set_price(self.config.trading_pair, mid)
-        base_avail, quote_avail = self.pool.get_available_reserves(self.config.floor_ratio)
+        base_avail, quote_avail = self._get_order_budgets(mid)
 
         orders = self._generate_orders(mid, base_avail, quote_avail)
         orders = self.balance_gate.scale_orders(orders)
@@ -310,6 +330,16 @@ class DeltaDefiAMM(ScriptStrategyBase):
         self._refresh_timestamp = self.current_timestamp + self.config.order_refresh_time
 
     # ---- Order generation -------------------------------------------------
+
+    def _get_order_budgets(self, mid: Decimal):
+        """Return available base/quote for order sizing, capped to real balance.
+        Virtual pool reserves control the k-curve shape (pricing), but order
+        sizes must reflect what the account can actually fill."""
+        virt_base, virt_quote = self.pool.get_available_reserves(self.config.floor_ratio)
+        real_base, real_quote = self.balance_gate.get_real_balances()
+        usable_base = real_base * self.config.balance_buffer_pct
+        usable_quote = real_quote * self.config.balance_buffer_pct
+        return min(virt_base, usable_base), min(virt_quote, usable_quote)
 
     def _generate_orders(
         self, mid_price: Decimal, avail_base: Decimal, avail_quote: Decimal
@@ -446,7 +476,7 @@ class DeltaDefiAMM(ScriptStrategyBase):
         if book_mid is None or book_mid <= ZERO:
             return
 
-        amm_mid = self.pool.get_mid_price()
+        amm_mid = self.pool.get_mid_price(self.config.pool_price_weight)
         divergence = abs(amm_mid - book_mid) / book_mid
 
         if divergence <= self.config.rebalance_threshold:
@@ -530,7 +560,7 @@ class DeltaDefiAMM(ScriptStrategyBase):
             # Update anchor BEFORE cancelling — after cancel, book may be thin
             book_mid = self._get_book_mid()
             if book_mid:
-                self.pool.anchor_price = book_mid
+                self._update_anchor_ema(book_mid)
 
             results = await connector.cancel_all(timeout_seconds=10.0)
 
@@ -540,9 +570,9 @@ class DeltaDefiAMM(ScriptStrategyBase):
                 self.logger().warning("cancel_all had failures — skipping requote to avoid duplicate orders.")
                 return
 
-            mid = self.pool.get_mid_price()
+            mid = self.pool.get_mid_price(self.config.pool_price_weight)
             RateOracle.get_instance().set_price(self.config.trading_pair, mid)
-            base_avail, quote_avail = self.pool.get_available_reserves(self.config.floor_ratio)
+            base_avail, quote_avail = self._get_order_budgets(mid)
             orders = self._generate_orders(mid, base_avail, quote_avail)
             orders = self.balance_gate.scale_orders(orders)
             order_ids = self._place_orders(orders)
@@ -575,6 +605,14 @@ class DeltaDefiAMM(ScriptStrategyBase):
             return mid if mid is not None and mid > ZERO else None
         except Exception:
             return None
+
+    def _update_anchor_ema(self, book_mid: Decimal):
+        """Update pool anchor toward book_mid via EMA."""
+        if self.pool.anchor_price and self.pool.anchor_price > ZERO:
+            alpha = self.config.anchor_ema_alpha
+            self.pool.anchor_price = alpha * book_mid + (D(1) - alpha) * self.pool.anchor_price
+        else:
+            self.pool.anchor_price = book_mid
 
     # ---- Pool auto-scaling ------------------------------------------------
 
@@ -668,9 +706,11 @@ class DeltaDefiAMM(ScriptStrategyBase):
         if not self.ready_to_trade:
             return "Market connectors are not ready."
 
-        pool_mid = self.pool.get_mid_price()
+        blended_mid = self.pool.get_mid_price(self.config.pool_price_weight)
         book_mid = self._get_book_mid()
         book_str = f"{book_mid:.6f}" if book_mid else "n/a"
+        k_price = self.pool.get_pool_price()
+        k_price_str = f"{k_price:.6f}" if k_price else "n/a"
 
         base_pct = self.pool.base / self.pool.initial_base * D(100)
         quote_pct = self.pool.quote / self.pool.initial_quote * D(100)
@@ -682,8 +722,10 @@ class DeltaDefiAMM(ScriptStrategyBase):
         pnl = self._get_pnl()
         pnl_str = f"{pnl:+.4f}" if pnl is not None else "n/a"
 
+        w = self.config.pool_price_weight
         lines = [
-            f"  [AMM {self.config.trading_pair}] Anchor: {book_str} | Pool: {pool_mid:.6f}",
+            f"  [AMM {self.config.trading_pair}] Mid: {blended_mid:.6f} (AMM {w:.0%} + PMM {D(1) - w:.0%})",
+            f"  Anchor: {book_str} | k-price: {k_price_str} | EMA alpha: {self.config.anchor_ema_alpha}",
             f"  VPool: {base_pct:.1f}%B / {quote_pct:.1f}%Q | Skew: {skew:+.3f}",
             f"  Real: {real_base:.2f} {base_token} / {real_quote:.2f} {quote_token}",
             f"  P&L: {pnl_str} {quote_token} (limit: -{self.config.max_cumulative_loss})",
