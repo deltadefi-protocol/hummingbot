@@ -24,7 +24,7 @@ ZERO = D("0")
 PAIR_PRESETS = {
     "ADA-USDM": {"initial_price": D("0.27")},
     "IAG-USDM": {"initial_price": D("0.26")},
-    "NIGHT-USDM": {"initial_price": D("0.0001")},
+    "NIGHT-USDM": {"initial_price": D("0.0585")},
 }
 
 
