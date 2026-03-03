@@ -1,8 +1,6 @@
-import importlib
 import inspect
 import os
 import re
-import sys
 from os import listdir
 from os.path import exists, isfile, join
 from typing import List
@@ -13,6 +11,7 @@ from prompt_toolkit.document import Document
 from hummingbot.client import settings
 from hummingbot.client.command.connect_command import OPTIONS as CONNECT_OPTIONS
 from hummingbot.client.config.config_data_types import BaseClientModel
+from hummingbot.client.config.script_loader import list_script_names, load_script_module
 from hummingbot.client.settings import (
     GATEWAY_CHAINS,
     GATEWAY_CONNECTORS,
@@ -81,18 +80,15 @@ class HummingbotCompleter(Completer):
         self._list_gateway_wallets_parameters = {"wallets": [], "chain": ""}
 
     def get_strategies_v2_with_config(self):
-        file_names = file_name_list(str(SCRIPT_STRATEGIES_PATH), "py")
+        external_path = getattr(
+            self.hummingbot_application.client_config_map, "external_scripts_path", None
+        )
+        script_names = list_script_names(SCRIPT_STRATEGIES_PATH, external_path)
         strategies_with_config = []
 
-        for script_name in file_names:
+        for script_name in script_names:
             try:
-                script_name = script_name.replace(".py", "")
-                module = sys.modules.get(f"{settings.SCRIPT_STRATEGIES_MODULE}.{script_name}")
-                if module is not None:
-                    script_module = importlib.reload(module)
-                else:
-                    script_module = importlib.import_module(f".{script_name}",
-                                                            package=settings.SCRIPT_STRATEGIES_MODULE)
+                script_module = load_script_module(script_name, SCRIPT_STRATEGIES_PATH, external_path)
                 config_class = next((member for member_name, member in inspect.getmembers(script_module)
                                      if inspect.isclass(member) and member not in [BaseClientModel, StrategyV2ConfigBase] and
                                      (issubclass(member, BaseClientModel) or issubclass(member, StrategyV2ConfigBase))))
