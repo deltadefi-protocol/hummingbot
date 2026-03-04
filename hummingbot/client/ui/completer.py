@@ -1,4 +1,5 @@
 import inspect
+import logging
 import os
 import re
 from os import listdir
@@ -80,10 +81,13 @@ class HummingbotCompleter(Completer):
         self._list_gateway_wallets_parameters = {"wallets": [], "chain": ""}
 
     def get_strategies_v2_with_config(self):
+        logger = logging.getLogger(__name__)
         external_path = getattr(
             self.hummingbot_application.client_config_map, "external_scripts_path", None
         )
+        logger.info(f"V2 completer: external_path={external_path}, builtin_path={SCRIPT_STRATEGIES_PATH}")
         script_names = list_script_names(SCRIPT_STRATEGIES_PATH, external_path)
+        logger.info(f"V2 completer: found scripts={script_names}")
         strategies_with_config = []
 
         for script_name in script_names:
@@ -94,8 +98,9 @@ class HummingbotCompleter(Completer):
                                      (issubclass(member, BaseClientModel) or issubclass(member, StrategyV2ConfigBase))))
                 if config_class:
                     strategies_with_config.append(script_name)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"V2 completer: failed to load '{script_name}': {type(e).__name__}: {e}")
+        logger.info(f"V2 completer: strategies_with_config={strategies_with_config}")
         return WordCompleter(strategies_with_config, ignore_case=True)
 
     def get_available_controllers(self):
