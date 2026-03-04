@@ -295,6 +295,7 @@ class DeltaDefiAMM(StrategyV2Base):
 
         self.balance_gate = BalanceGate(connectors[self.config.exchange], self.config)
         self._recent_fills: deque = deque()
+        self._last_max_safe: Decimal = ZERO  # updated each order cycle
 
     # ---- Main loop --------------------------------------------------------
 
@@ -342,9 +343,8 @@ class DeltaDefiAMM(StrategyV2Base):
             self._update_anchor_ema(book_mid)
         mid = self.pool.get_mid_price(self.config.pool_price_weight)
         RateOracle.get_instance().set_price(self.config.trading_pair, mid)
-        base_avail, quote_avail = self._get_order_budgets()
 
-        orders = self._generate_orders(mid, base_avail, quote_avail)
+        orders = self._generate_orders(mid)
         orders = self.balance_gate.scale_orders(orders)
         self._place_orders(orders)
 
@@ -353,22 +353,52 @@ class DeltaDefiAMM(StrategyV2Base):
 
     # ---- Order generation -------------------------------------------------
 
-    def _get_order_budgets(self):
-        """Return available base/quote for order sizing, capped to real balance.
-        Virtual pool reserves control the k-curve shape (pricing), but order
-        sizes must reflect what the account can actually fill."""
-        virt_base, virt_quote = self.pool.get_available_reserves(self.config.floor_ratio)
+    def _max_safe_order_base(self) -> Decimal:
+        """Max order size (in base) that won't trigger ping-pong.
+
+        No-ping-pong condition: blended_shift < spread
+          blended_shift ≈ (dB/B) × [(1-w)/A + 2w]
+          => dB < B × spread / shift_factor
+        """
+        w = self.config.pool_price_weight
+        A = self.config.amplification
+        spread = self.config.base_spread_bps / D("10000")
+
+        shift_factor = (D(1) - w) / A + D(2) * w
+        if shift_factor <= ZERO:
+            return D("999999999")
+
+        max_dB_over_B = spread / shift_factor
+        max_base = self.pool.base * max_dB_over_B
+        # Also express as quote limit for the bid side
+        self._last_max_safe = max_base  # cache for status display
+        return max_base
+
+    def _compute_order_value(self, mid: Decimal) -> Decimal:
+        """Order value (in quote) = order_amount_pct × total capital."""
+        real_base, real_quote = self.balance_gate.get_real_balances()
+        total_capital = real_base * mid + real_quote
+        return total_capital * self.config.order_amount_pct
+
+    def _generate_orders(self, mid_price: Decimal) -> List[OrderProposal]:
+        orders: List[OrderProposal] = []
+
+        order_value = self._compute_order_value(mid_price)
+        max_safe_base = self._max_safe_order_base()
+        max_safe_value = max_safe_base * mid_price
+
+        # Cap order value to ping-pong-safe maximum
+        if order_value > max_safe_value:
+            self._pair_logger.info(
+                f"Ping-pong guard: order {order_value:.2f} → {max_safe_value:.2f} "
+                f"(max safe {max_safe_base:.1f} base)"
+            )
+            order_value = max_safe_value
+
+        # Cap to real balance (buffer already applied)
         real_base, real_quote = self.balance_gate.get_real_balances()
         usable_base = real_base * self.config.balance_buffer_pct
         usable_quote = real_quote * self.config.balance_buffer_pct
-        return min(virt_base, usable_base), min(virt_quote, usable_quote)
-
-    def _generate_orders(
-        self, mid_price: Decimal, avail_base: Decimal, avail_quote: Decimal
-    ) -> List[OrderProposal]:
-        orders: List[OrderProposal] = []
-        total_ask_budget = avail_base * self.config.order_amount_pct
-        total_bid_budget = avail_quote * self.config.order_amount_pct
 
         weights = [self.config.size_decay ** i for i in range(self.config.num_levels)]
         total_weight = sum(weights)
@@ -381,6 +411,7 @@ class DeltaDefiAMM(StrategyV2Base):
         for i in range(self.config.num_levels):
             base_spread = self.config.base_spread_bps * (self.config.spread_multiplier ** i) / D("10000")
             w = weights[i] / total_weight
+            layer_value = order_value * w
 
             if self.config.enable_asymmetric_spread:
                 bid_spread, ask_spread = self._asymmetric_spreads(base_spread)
@@ -390,8 +421,12 @@ class DeltaDefiAMM(StrategyV2Base):
             ask_price = mid_price * (D(1) + ask_spread)
             bid_price = mid_price * (D(1) - bid_spread)
 
-            ask_size = total_ask_budget * w
-            bid_size = (total_bid_budget * w) / bid_price if bid_price > ZERO else ZERO
+            ask_size = layer_value / ask_price if ask_price > ZERO else ZERO
+            bid_size = layer_value / bid_price if bid_price > ZERO else ZERO
+
+            # Cap each side to real balance
+            ask_size = min(ask_size, usable_base)
+            bid_size = min(bid_size, usable_quote / bid_price) if bid_price > ZERO else ZERO
 
             if self.config.enable_order_randomization:
                 ask_size = self._randomize(ask_size)
@@ -606,8 +641,7 @@ class DeltaDefiAMM(StrategyV2Base):
 
             mid = self.pool.get_mid_price(self.config.pool_price_weight)
             RateOracle.get_instance().set_price(self.config.trading_pair, mid)
-            base_avail, quote_avail = self._get_order_budgets()
-            orders = self._generate_orders(mid, base_avail, quote_avail)
+            orders = self._generate_orders(mid)
             orders = self.balance_gate.scale_orders(orders)
             order_ids = self._place_orders(orders)
             self._refresh_timestamp = self.current_timestamp + self.config.order_refresh_time
@@ -750,12 +784,22 @@ class DeltaDefiAMM(StrategyV2Base):
         pnl = self._get_pnl()
         pnl_str = f"{pnl:+.4f}" if pnl is not None else "n/a"
 
+        total_capital = real_base * blended_mid + real_quote
+        order_value = total_capital * self.config.order_amount_pct
+        max_safe_str = f"{self._last_max_safe:.1f}" if self._last_max_safe > ZERO else "n/a"
+        max_safe_value = self._last_max_safe * blended_mid if self._last_max_safe > ZERO else ZERO
+        capped = order_value > max_safe_value and max_safe_value > ZERO
+        guard_str = f"CAPPED to {max_safe_value:.1f}" if capped else "ok"
+
         lines = [
             f"  [AMM {self.config.trading_pair}] Mid: {blended_mid:.6f} "
             f"({w * 100:.0f}% AMM / {(1 - w) * 100:.0f}% PMM)",
             f"  Anchor: {book_str} | k-price: {kp_str} | PMM-mid: {anchor_mid:.6f}",
             f"  VPool: {base_pct:.1f}%B / {quote_pct:.1f}%Q | Skew: {skew:+.3f}",
-            f"  Real: {real_base:.2f} {base_token} / {real_quote:.2f} {quote_token}",
+            f"  Real: {real_base:.2f} {base_token} / {real_quote:.2f} {quote_token}"
+            f" | Capital: {total_capital:.1f} {quote_token}",
+            f"  Order: {self.config.order_amount_pct * 100:.1f}% = {order_value:.1f} {quote_token}"
+            f" | Guard: {max_safe_str} {base_token} ({guard_str})",
             f"  P&L: {pnl_str} {quote_token} (limit: -{self.config.max_cumulative_loss})",
         ]
 
