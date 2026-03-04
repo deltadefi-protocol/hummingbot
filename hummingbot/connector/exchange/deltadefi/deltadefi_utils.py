@@ -1,0 +1,78 @@
+from decimal import Decimal
+from typing import Any, Dict
+
+from pydantic import Field, SecretStr
+
+from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
+from hummingbot.core.data_type.trade_fee import TradeFeeSchema
+
+CENTRALIZED = True
+
+EXAMPLE_PAIR = "ADA-USDM"
+
+DEFAULT_FEES = TradeFeeSchema(
+    maker_percent_fee_decimal=Decimal("0.001"),
+    taker_percent_fee_decimal=Decimal("0.001"),
+)
+
+
+class DeltaDefiConfigMap(BaseConnectorConfigMap):
+    connector: str = "deltadefi"
+    deltadefi_api_key: SecretStr = Field(
+        default=...,
+        json_schema_extra={
+            "prompt": "Enter your DeltaDeFi API key",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    deltadefi_password: SecretStr = Field(
+        default=...,
+        json_schema_extra={
+            "prompt": "Enter your DeltaDeFi wallet password (for signing transactions)",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    deltadefi_network: str = Field(
+        default="mainnet",
+        json_schema_extra={
+            "prompt": "Which DeltaDeFi network? (mainnet/testnet/local)",
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
+    )
+    deltadefi_custom_rest_url: str = Field(
+        default="",
+        json_schema_extra={
+            "prompt": "Custom REST API URL (leave empty for default)",
+            "is_connect_key": False,
+            "prompt_on_new": False,
+        }
+    )
+    deltadefi_custom_wss_url: str = Field(
+        default="",
+        json_schema_extra={
+            "prompt": "Custom WebSocket URL (leave empty for default)",
+            "is_connect_key": False,
+            "prompt_on_new": False,
+        }
+    )
+
+
+KEYS = DeltaDefiConfigMap.model_construct()
+
+
+def is_exchange_information_valid(exchange_info: Dict[str, Any]) -> bool:
+    """Validate a MarketConfigTradingPair entry from /app/market-config."""
+    base_token = exchange_info.get("base_token", {})
+    quote_token = exchange_info.get("quote_token", {})
+    return (
+        exchange_info.get("symbol", "") != ""
+        and isinstance(base_token, dict)
+        and base_token.get("symbol", "") != ""
+        and isinstance(quote_token, dict)
+        and quote_token.get("symbol", "") != ""
+    )
