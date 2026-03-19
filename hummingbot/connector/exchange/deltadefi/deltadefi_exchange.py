@@ -425,6 +425,9 @@ class DeltadefiExchange(ExchangePyBase):
             raise
 
         if isinstance(cancel_result, dict):
+            # DeltaDeFi returns {'order_id': '<uuid>'} on successful cancel
+            if "order_id" in cancel_result and "error" not in cancel_result:
+                return True
             status = cancel_result.get("status", "").lower()
             if status in ("success", "cancelled", "canceled"):
                 return True
@@ -616,6 +619,28 @@ class DeltadefiExchange(ExchangePyBase):
         if self._health_monitor is not None:
             self._health_monitor.update()
 
+    # --- API request override: retry on "trading locked" (5002) ---
+
+    _TRADING_LOCKED_PAUSE = 60  # seconds to wait before retry
+
+    async def _api_request(self, path_url, **kwargs) -> Dict[str, Any]:
+        attempt = 0
+        while True:
+            try:
+                return await super()._api_request(path_url=path_url, **kwargs)
+            except IOError as e:
+                err_str = str(e)
+                if "5002" in err_str or "trading is currently locked" in err_str.lower():
+                    attempt += 1
+                    self.logger().warning(
+                        f"Trading locked (5002) on {path_url}. "
+                        f"Pausing {self._TRADING_LOCKED_PAUSE}s before retry "
+                        f"(attempt {attempt})..."
+                    )
+                    await asyncio.sleep(self._TRADING_LOCKED_PAUSE)
+                    continue
+                raise
+
     # --- Network lifecycle with reconciliation and operation key ---
 
     async def start_network(self):
@@ -698,7 +723,7 @@ class DeltadefiExchange(ExchangePyBase):
                 return [CancellationResult(o.client_order_id, True) for o in incomplete_orders]
             except IOError as e:
                 if "429" in str(e) and attempt < max_retries - 1:
-                    wait = 0.5 * (2 ** attempt)
+                    wait = 5 * (2 ** attempt)
                     self.logger().warning(
                         f"cancel_all rate-limited (429), retrying in {wait}s "
                         f"(attempt {attempt + 1}/{max_retries})"
